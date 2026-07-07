@@ -15,10 +15,17 @@ import (
 
 var getSystemTimes = kernel32.NewProc("GetSystemTimes")
 var getTickCount64 = kernel32.NewProc("GetTickCount64")
+var getIfTable2Ex = iphlpapi.NewProc("GetIfTable2Ex")
+var freeMibTable = iphlpapi.NewProc("FreeMibTable")
 
 type filetime struct {
 	LowDateTime  uint32
 	HighDateTime uint32
+}
+
+type mibIfTable2 struct {
+	NumEntries uint32
+	Table      [1]windows.MibIfRow2
 }
 
 func windowsReadCPUTimes() (cpuTimes, bool) {
@@ -73,45 +80,85 @@ func windowsProcessCount() int64 {
 }
 
 func windowsNetworkTotals() networkTotals {
-	// Keep totals empty for now rather than shelling out every 2 seconds; Windows
-	// interface counters need a larger native IP Helper binding than the rest of
-	// this lightweight collector.
-	return networkTotals{}
+	var table *mibIfTable2
+	result, _, _ := getIfTable2Ex.Call(uintptr(windows.MibIfEntryNormal), uintptr(unsafe.Pointer(&table)))
+	if result != 0 || table == nil {
+		return windowsNetworkTotalsLegacy()
+	}
+	defer freeMibTable.Call(uintptr(unsafe.Pointer(table)))
+
+	var totals networkTotals
+	rowSize := unsafe.Sizeof(windows.MibIfRow2{})
+	base := uintptr(unsafe.Pointer(&table.Table[0]))
+	for index := uint32(0); index < table.NumEntries; index++ {
+		row := (*windows.MibIfRow2)(unsafe.Pointer(base + uintptr(index)*rowSize))
+		if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+			continue
+		}
+		totals.InBytes += int64(row.InOctets)
+		totals.OutBytes += int64(row.OutOctets)
+	}
+	return totals
+}
+
+func windowsNetworkTotalsLegacy() networkTotals {
+	var size uint32 = 15 * 1024
+	buffer := make([]byte, size)
+	err := windows.GetAdaptersInfo((*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])), &size)
+	if err == windows.ERROR_BUFFER_OVERFLOW {
+		buffer = make([]byte, size)
+		err = windows.GetAdaptersInfo((*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])), &size)
+	}
+	if err != nil {
+		return networkTotals{}
+	}
+	var totals networkTotals
+	for adapter := (*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])); adapter != nil; adapter = adapter.Next {
+		row := windows.MibIfRow{Index: adapter.Index}
+		if err := windows.GetIfEntry(&row); err != nil {
+			continue
+		}
+		if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+			continue
+		}
+		totals.InBytes += int64(row.InOctets)
+		totals.OutBytes += int64(row.OutOctets)
+	}
+	return totals
 }
 
 func windowsOSRelease() (string, string) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, registry.QUERY_VALUE)
 	if err != nil {
-		return "windows", ""
+		return "Windows", ""
 	}
 	defer key.Close()
 	product := registryString(key, "ProductName")
+	if product == "" {
+		product = "Windows"
+	}
 	display := registryString(key, "DisplayVersion")
 	if display == "" {
 		display = registryString(key, "ReleaseId")
 	}
-	build := registryString(key, "CurrentBuildNumber")
-	ubr, _, _ := key.GetIntegerValue("UBR")
-	parts := []string{}
-	if product != "" {
-		parts = append(parts, product)
-	}
-	if display != "" {
-		parts = append(parts, display)
-	}
-	if build != "" {
-		if ubr > 0 {
-			parts = append(parts, fmt.Sprintf("build %s.%d", build, ubr))
-		} else {
-			parts = append(parts, "build "+build)
-		}
-	}
-	return "windows", strings.Join(parts, " ")
+	return product, display
 }
 
 func windowsKernelRelease() string {
-	_, version := windowsOSRelease()
-	return version
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer key.Close()
+	build := registryString(key, "CurrentBuildNumber")
+	if build == "" {
+		return ""
+	}
+	ubr, _, _ := key.GetIntegerValue("UBR")
+	if ubr > 0 {
+		return fmt.Sprintf("build %s.%d", build, ubr)
+	}
+	return "build " + build
 }
 
 func windowsVirtualizationName() string {

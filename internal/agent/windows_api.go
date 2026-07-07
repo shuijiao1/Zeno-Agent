@@ -5,3 +5,4 @@ package agent
 import "syscall"
 
 var kernel32 = syscall.NewLazyDLL("kernel32.dll")
+var iphlpapi = syscall.NewLazyDLL("iphlpapi.dll")
