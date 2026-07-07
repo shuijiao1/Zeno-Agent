@@ -8,7 +8,10 @@ $TokenFile = if ($env:ZENO_AGENT_TOKEN_FILE) { $env:ZENO_AGENT_TOKEN_FILE } else
 $ControllerURL = $env:ZENO_CONTROLLER_URL
 $NodeID = $env:ZENO_NODE_ID
 $Token = $env:ZENO_AGENT_TOKEN
-$Interval = if ($env:ZENO_AGENT_INTERVAL) { $env:ZENO_AGENT_INTERVAL } else { '2s' }
+$StateInterval = if ($env:ZENO_AGENT_STATE_INTERVAL) { $env:ZENO_AGENT_STATE_INTERVAL } elseif ($env:ZENO_AGENT_INTERVAL) { $env:ZENO_AGENT_INTERVAL } else { '3s' }
+$HeartbeatInterval = if ($env:ZENO_AGENT_HEARTBEAT_INTERVAL) { $env:ZENO_AGENT_HEARTBEAT_INTERVAL } else { '15s' }
+$HostInterval = if ($env:ZENO_AGENT_HOST_INTERVAL) { $env:ZENO_AGENT_HOST_INTERVAL } else { '30m' }
+$IdentityRefreshInterval = if ($env:ZENO_AGENT_IDENTITY_REFRESH_INTERVAL) { $env:ZENO_AGENT_IDENTITY_REFRESH_INTERVAL } else { '12h' }
 $NetworkInterfaces = $env:ZENO_AGENT_NETWORK_INTERFACES
 $DiskMounts = $env:ZENO_AGENT_DISK_MOUNTS
 $ServiceName = if ($env:ZENO_AGENT_SERVICE_NAME) { $env:ZENO_AGENT_SERVICE_NAME } else { 'zeno-agent' }
@@ -76,7 +79,10 @@ try {
     '-controller-url', $ControllerURL,
     '-node-id', $NodeID,
     '-token-file', $TokenFile,
-    '-interval', $Interval,
+    '-state-interval', $StateInterval,
+    '-heartbeat-interval', $HeartbeatInterval,
+    '-host-interval', $HostInterval,
+    '-identity-refresh-interval', $IdentityRefreshInterval,
     '-version', $Version
   )
   if ($NetworkInterfaces) { $Args += @('-network-interfaces', $NetworkInterfaces) }

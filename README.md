@@ -33,7 +33,10 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_NODE_ID`：后台服务器 ID
 - `ZENO_AGENT_TOKEN`：该节点 token
 - `ZENO_AGENT_VERSION`：默认 `latest`，可固定为 `v0.1.0`
-- `ZENO_AGENT_INTERVAL`：状态上报间隔，默认 `2s`
+- `ZENO_AGENT_STATE_INTERVAL`：实时资源 state 上报间隔，默认 `3s`；旧 `ZENO_AGENT_INTERVAL` 仍作为兼容别名
+- `ZENO_AGENT_HEARTBEAT_INTERVAL`：heartbeat 上报间隔，默认 `15s`，用于 last_seen/debug
+- `ZENO_AGENT_HOST_INTERVAL`：静态机器信息上报间隔，默认 `30m`
+- `ZENO_AGENT_IDENTITY_REFRESH_INTERVAL`：公网 IPv4/IPv6 与 GeoIP 刷新间隔，默认 `12h`
 - `ZENO_AGENT_NETWORK_INTERFACES`：网络接口 allowlist，逗号分隔；默认排除 Docker/veth/br-/tun/tailscale/kube/vmbr/tap 等虚拟接口
 - `ZENO_AGENT_DISK_MOUNTS`：磁盘统计路径 allowlist，逗号分隔；默认汇总真实文件系统分区并排除 overlay/tmpfs/proc/sysfs/docker/kubelet 等挂载
 - `ZENO_AGENT_TOKEN_FILE`：token 文件路径，默认 `/etc/zeno/agent-token`
@@ -61,4 +64,4 @@ journalctl -u zeno-agent.service -f
 
 ## 安全边界
 
-Zeno Agent 不提供远程命令、终端、文件管理或任务执行能力，只主动向 Controller 发起 HTTPS/JSON 上报。
+Zeno Agent 不提供远程命令、终端、文件管理或任务执行能力，只主动向 Controller 发起 HTTPS/JSON 上报，并通过 presence WebSocket 接收“探针配置已变更”的轻量通知；完整探针配置仍由 Agent 使用原 HTTP 鉴权接口主动拉取。

@@ -9,7 +9,10 @@ TOKEN_FILE="${ZENO_AGENT_TOKEN_FILE:-}"
 CONTROLLER_URL="${ZENO_CONTROLLER_URL:-}"
 NODE_ID="${ZENO_NODE_ID:-}"
 TOKEN="${ZENO_AGENT_TOKEN:-}"
-INTERVAL="${ZENO_AGENT_INTERVAL:-2s}"
+STATE_INTERVAL="${ZENO_AGENT_STATE_INTERVAL:-${ZENO_AGENT_INTERVAL:-3s}}"
+HEARTBEAT_INTERVAL="${ZENO_AGENT_HEARTBEAT_INTERVAL:-15s}"
+HOST_INTERVAL="${ZENO_AGENT_HOST_INTERVAL:-30m}"
+IDENTITY_REFRESH_INTERVAL="${ZENO_AGENT_IDENTITY_REFRESH_INTERVAL:-12h}"
 NETWORK_INTERFACES="${ZENO_AGENT_NETWORK_INTERFACES:-}"
 DISK_MOUNTS="${ZENO_AGENT_DISK_MOUNTS:-}"
 
@@ -129,7 +132,10 @@ if [ "$GOOS" = "darwin" ]; then
     <string>-controller-url</string><string>$(xml_escape "$CONTROLLER_URL")</string>
     <string>-node-id</string><string>$(xml_escape "$NODE_ID")</string>
     <string>-token-file</string><string>$(xml_escape "$TOKEN_FILE")</string>
-    <string>-interval</string><string>$(xml_escape "$INTERVAL")</string>
+    <string>-state-interval</string><string>$(xml_escape "$STATE_INTERVAL")</string>
+    <string>-heartbeat-interval</string><string>$(xml_escape "$HEARTBEAT_INTERVAL")</string>
+    <string>-host-interval</string><string>$(xml_escape "$HOST_INTERVAL")</string>
+    <string>-identity-refresh-interval</string><string>$(xml_escape "$IDENTITY_REFRESH_INTERVAL")</string>
     <string>-version</string><string>$(xml_escape "$VERSION")</string>
 ${plist_extra_args}
   </array>
@@ -159,7 +165,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN -controller-url $CONTROLLER_URL -node-id $NODE_ID -token-file $TOKEN_FILE -interval $INTERVAL -version $VERSION${systemd_extra_args}
+ExecStart=$BIN -controller-url $CONTROLLER_URL -node-id $NODE_ID -token-file $TOKEN_FILE -state-interval $STATE_INTERVAL -heartbeat-interval $HEARTBEAT_INTERVAL -host-interval $HOST_INTERVAL -identity-refresh-interval $IDENTITY_REFRESH_INTERVAL -version $VERSION${systemd_extra_args}
 Restart=always
 RestartSec=5s
 
