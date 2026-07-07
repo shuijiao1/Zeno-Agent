@@ -46,7 +46,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 	cpu := c.cpuPercent()
 	memTotal, memAvailable := readMemoryTotals()
 	swapTotal, swapFree := readSwapTotals()
-	load1, load5, load15 := readLoadAverages()
+	load1, load5, load15 := readLoadAverages(cpu, runtime.NumCPU())
 	diskUsed, diskTotal := diskUsage("/")
 	netTotals := readNetworkTotals()
 	var inSpeed, outSpeed float64
@@ -117,6 +117,9 @@ type cpuTimes struct {
 }
 
 func readCPUTimes() (cpuTimes, bool) {
+	if runtime.GOOS == "windows" {
+		return windowsReadCPUTimes()
+	}
 	content, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return cpuTimes{}, false
@@ -185,7 +188,10 @@ func parseMemoryStats(content string) memoryStats {
 	return stats
 }
 
-func readLoadAverages() (load1, load5, load15 float64) {
+func readLoadAverages(cpuPercent float64, cpuCores int) (load1, load5, load15 float64) {
+	if runtime.GOOS == "windows" {
+		return windowsLoadAverages(cpuPercent, cpuCores)
+	}
 	content, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
 		return 0, 0, 0
@@ -201,6 +207,9 @@ func readLoadAverages() (load1, load5, load15 float64) {
 }
 
 func processCount() int64 {
+	if runtime.GOOS == "windows" {
+		return windowsProcessCount()
+	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0
@@ -254,6 +263,9 @@ type networkTotals struct {
 }
 
 func readNetworkTotals() networkTotals {
+	if runtime.GOOS == "windows" {
+		return windowsNetworkTotals()
+	}
 	content, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
 		return networkTotals{}
@@ -283,6 +295,9 @@ func readNetworkTotals() networkTotals {
 }
 
 func osRelease() (string, string) {
+	if runtime.GOOS == "windows" {
+		return windowsOSRelease()
+	}
 	content, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return "linux", ""
@@ -296,6 +311,9 @@ func osRelease() (string, string) {
 }
 
 func kernelRelease() string {
+	if runtime.GOOS == "windows" {
+		return windowsKernelRelease()
+	}
 	content, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil {
 		return ""
@@ -304,6 +322,9 @@ func kernelRelease() string {
 }
 
 func virtualizationName() string {
+	if runtime.GOOS == "windows" {
+		return windowsVirtualizationName()
+	}
 	for _, path := range []string{"/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"} {
 		content, err := os.ReadFile(path)
 		if err == nil {
@@ -317,6 +338,9 @@ func virtualizationName() string {
 }
 
 func cpuModel() string {
+	if runtime.GOOS == "windows" {
+		return windowsCPUModel()
+	}
 	content, err := os.ReadFile("/proc/cpuinfo")
 	if err != nil {
 		return ""
@@ -333,6 +357,9 @@ func cpuModel() string {
 }
 
 func bootTime() int64 {
+	if runtime.GOOS == "windows" {
+		return windowsBootTime()
+	}
 	content, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0
@@ -349,6 +376,9 @@ func bootTime() int64 {
 }
 
 func uptimeSeconds() int64 {
+	if runtime.GOOS == "windows" {
+		return windowsUptimeSeconds()
+	}
 	content, err := os.ReadFile("/proc/uptime")
 	if err != nil {
 		return 0
