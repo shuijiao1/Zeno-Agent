@@ -81,6 +81,39 @@ func TestReportStateOnlyPostsStateWithoutHeartbeatOrProbeFetch(t *testing.T) {
 	}
 }
 
+func TestRunKeepsStateTickerWhileFullReportIsBlocked(t *testing.T) {
+	var statePosts int
+	blockProbeResults := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/v1/state":
+			statePosts++
+			w.WriteHeader(http.StatusAccepted)
+		case "/api/agent/v1/heartbeat", "/api/agent/v1/host":
+			w.WriteHeader(http.StatusAccepted)
+		case "/api/agent/v1/probe-targets":
+			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Targets: []agent.ProbeTarget{{ID: "blocked", Type: "unsupported", Count: 1, IntervalSec: 1}}})
+		case "/api/agent/v1/probe-results":
+			<-blockProbeResults
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	defer close(blockProbeResults)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 260*time.Millisecond)
+	defer cancel()
+	err := run(ctx, config{ControllerURL: server.URL, NodeID: "hytron", Token: "token", Interval: 50 * time.Millisecond, Version: "test"})
+	if err == nil || err != context.DeadlineExceeded {
+		t.Fatalf("run error = %v, want context deadline exceeded", err)
+	}
+	if statePosts < 3 {
+		t.Fatalf("state posts = %d, want state ticker to continue while full report is blocked", statePosts)
+	}
+}
+
 func TestReportOnceSkipsProbeResultsWhenNoTargetsAreDue(t *testing.T) {
 	var probePosts [][]string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
