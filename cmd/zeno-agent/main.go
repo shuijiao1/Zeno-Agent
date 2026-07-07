@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -43,9 +44,15 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg.Token = token
-	if err := run(context.Background(), cfg); err != nil {
+	if err := runPlatform(cfg); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func runConsole(cfg config) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	return run(ctx, cfg)
 }
 
 func run(ctx context.Context, cfg config) error {
