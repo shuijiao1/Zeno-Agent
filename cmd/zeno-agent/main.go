@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
@@ -93,6 +94,13 @@ func run(ctx context.Context, cfg config) error {
 		}()
 	}
 	startFullReport()
+	if delay := reportJitter(cfg.NodeID, cfg.Interval); delay > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 
 	stateTicker := time.NewTicker(cfg.Interval)
 	defer stateTicker.Stop()
@@ -114,6 +122,15 @@ func run(ctx context.Context, cfg config) error {
 
 type networkIdentityDiscoverer interface {
 	Discover(context.Context) agent.NetworkIdentity
+}
+
+func reportJitter(nodeID string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.TrimSpace(nodeID)))
+	return time.Duration(h.Sum64() % uint64(interval))
 }
 
 func reportOnce(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector, version string, includeHost bool, scheduler *agent.ProbeScheduler, identityDiscoverer networkIdentityDiscoverer) error {

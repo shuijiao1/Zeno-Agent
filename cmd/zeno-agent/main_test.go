@@ -58,6 +58,21 @@ func TestReportOnceAddsDiscoveredNetworkIdentityToHost(t *testing.T) {
 	}
 }
 
+func TestReportJitterStaggersNodesWithinInterval(t *testing.T) {
+	interval := 2 * time.Second
+	first := reportJitter("hytron", interval)
+	second := reportJitter("sharon", interval)
+	if first < 0 || first >= interval || second < 0 || second >= interval {
+		t.Fatalf("jitter outside interval: first=%s second=%s interval=%s", first, second, interval)
+	}
+	if first == second {
+		t.Fatalf("jitter should stagger different node ids, both got %s", first)
+	}
+	if got := reportJitter("hytron", interval); got != first {
+		t.Fatalf("jitter must be deterministic, got %s then %s", first, got)
+	}
+}
+
 func TestReportStateOnlyPostsStateWithoutHeartbeatOrProbeFetch(t *testing.T) {
 	var statePosts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
