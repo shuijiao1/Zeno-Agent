@@ -3,9 +3,9 @@ set -euo pipefail
 
 REPO="${ZENO_AGENT_REPO:-shuijiao1/Zeno-Agent}"
 VERSION="${ZENO_AGENT_VERSION:-latest}"
-INSTALL_DIR="${ZENO_AGENT_INSTALL_DIR:-/opt/zeno-agent}"
-BIN="${ZENO_AGENT_BIN:-/usr/local/bin/zeno-agent}"
-TOKEN_FILE="${ZENO_AGENT_TOKEN_FILE:-/etc/zeno/agent-token}"
+INSTALL_DIR="${ZENO_AGENT_INSTALL_DIR:-}"
+BIN="${ZENO_AGENT_BIN:-}"
+TOKEN_FILE="${ZENO_AGENT_TOKEN_FILE:-}"
 CONTROLLER_URL="${ZENO_CONTROLLER_URL:-}"
 NODE_ID="${ZENO_NODE_ID:-}"
 TOKEN="${ZENO_AGENT_TOKEN:-}"
@@ -41,6 +41,7 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$OS" in
   linux) GOOS=linux ;;
+  darwin) GOOS=darwin ;;
   *) fail "暂不支持系统: $OS" ;;
 esac
 case "$ARCH" in
@@ -72,7 +73,23 @@ tar -xzf "$TMP/$ASSET" -C "$TMP"
 FOUND=$(find "$TMP" -type f -name 'zeno-agent' | head -n1)
 [ -n "$FOUND" ] || fail "压缩包内未找到 zeno-agent"
 
-install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" /etc/zeno
+if [ -z "$INSTALL_DIR" ]; then
+  case "$GOOS" in
+    darwin) INSTALL_DIR="/Library/Application Support/Zeno Agent" ;;
+    *) INSTALL_DIR="/opt/zeno-agent" ;;
+  esac
+fi
+if [ -z "$BIN" ]; then
+  BIN="/usr/local/bin/zeno-agent"
+fi
+if [ -z "$TOKEN_FILE" ]; then
+  case "$GOOS" in
+    darwin) TOKEN_FILE="/Library/Application Support/Zeno/agent-token" ;;
+    *) TOKEN_FILE="/etc/zeno/agent-token" ;;
+  esac
+fi
+
+install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
 install -m 755 "$FOUND" "$BIN"
 if [ -n "$TOKEN" ]; then
   umask 077
@@ -80,7 +97,41 @@ if [ -n "$TOKEN" ]; then
 fi
 chmod 600 "$TOKEN_FILE"
 
-cat > /etc/systemd/system/zeno-agent.service <<EOF_SERVICE
+if [ "$GOOS" = "darwin" ]; then
+  PLIST="/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist"
+  xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+  }
+  cat > "$PLIST" <<EOF_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>li.shuijiao.zeno-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$BIN")</string>
+    <string>-controller-url</string><string>$(xml_escape "$CONTROLLER_URL")</string>
+    <string>-node-id</string><string>$(xml_escape "$NODE_ID")</string>
+    <string>-token-file</string><string>$(xml_escape "$TOKEN_FILE")</string>
+    <string>-interval</string><string>$(xml_escape "$INTERVAL")</string>
+    <string>-version</string><string>$(xml_escape "$VERSION")</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/zeno-agent.log</string>
+  <key>StandardErrorPath</key><string>/var/log/zeno-agent.err.log</string>
+</dict>
+</plist>
+EOF_PLIST
+  chown root:wheel "$PLIST" 2>/dev/null || true
+  chmod 644 "$PLIST"
+  launchctl bootout system "$PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$PLIST"
+  launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+  launchctl kickstart -k system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+else
+  cat > /etc/systemd/system/zeno-agent.service <<EOF_SERVICE
 [Unit]
 Description=Zeno Agent
 After=network-online.target
@@ -96,9 +147,10 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF_SERVICE
 
-systemctl daemon-reload
-systemctl enable --now zeno-agent.service >/dev/null
-systemctl restart zeno-agent.service
-systemctl is-active --quiet zeno-agent.service
+  systemctl daemon-reload
+  systemctl enable --now zeno-agent.service >/dev/null
+  systemctl restart zeno-agent.service
+  systemctl is-active --quiet zeno-agent.service
+fi
 
 echo "Zeno Agent 已安装并启动: node=$NODE_ID version=$VERSION"

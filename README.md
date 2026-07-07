@@ -12,7 +12,9 @@ Controller 本体仓库：<https://github.com/shuijiao1/Zeno>
 
 ## 一键安装
 
-先在 Zeno Admin 后台创建 / 编辑服务器并生成该节点的 Agent token，然后执行：
+先在 Zeno Admin 后台创建 / 编辑服务器并生成该节点的 Agent token，然后按目标系统复制后台生成的命令执行。
+
+Linux / macOS：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuijiao1/Zeno-Agent/main/install.sh | sudo env \
@@ -22,6 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/shuijiao1/Zeno-Agent/main/install.s
   ZENO_AGENT_VERSION=v0.1.0 \
   bash
 ```
+
+Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会下载 `install.ps1`，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
 
 变量说明：
 
@@ -33,13 +37,15 @@ curl -fsSL https://raw.githubusercontent.com/shuijiao1/Zeno-Agent/main/install.s
 - `ZENO_AGENT_TOKEN_FILE`：token 文件路径，默认 `/etc/zeno/agent-token`
 - `ZENO_AGENT_BIN`：二进制安装路径，默认 `/usr/local/bin/zeno-agent`
 
-安装脚本只写入 / 更新 `zeno-agent.service`，不会安装 Controller，也不会修改业务服务。
+Linux 安装脚本会写入 / 更新 `zeno-agent.service`；macOS 会写入 `/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist`；Windows 会注册 `zeno-agent` 服务。安装脚本不会安装 Controller，也不会修改业务服务。
 
 ## 手动构建
 
 ```bash
 go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/zeno-agent ./cmd/zeno-agent
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/zeno-agent-darwin-arm64 ./cmd/zeno-agent
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/zeno-agent.exe ./cmd/zeno-agent
 ```
 
 ## systemd
