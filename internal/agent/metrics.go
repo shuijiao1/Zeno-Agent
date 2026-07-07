@@ -145,12 +145,7 @@ func readCPUTimes() (cpuTimes, bool) {
 }
 
 func readMemoryTotals() (total int64, available int64) {
-	content, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0, 0
-	}
-	stats := parseMemoryStats(string(content))
-	return stats.memTotal, stats.memAvailable
+	return platformMemoryTotals()
 }
 
 type memoryStats struct {
@@ -161,12 +156,7 @@ type memoryStats struct {
 }
 
 func readSwapTotals() (total int64, free int64) {
-	content, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0, 0
-	}
-	stats := parseMemoryStats(string(content))
-	return stats.swapTotal, stats.swapFree
+	return platformSwapTotals()
 }
 
 func parseMemoryStats(content string) memoryStats {
