@@ -53,17 +53,21 @@ try {
   $Found = Get-ChildItem -Path $Temp -Recurse -Filter 'zeno-agent.exe' | Select-Object -First 1
   if (-not $Found) { Fail '压缩包内未找到 zeno-agent.exe' }
 
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Bin), (Split-Path -Parent $TokenFile) | Out-Null
-  Copy-Item -Force -Path $Found.FullName -Destination $Bin
-  if ($Token) {
-    Set-Content -Path $TokenFile -Value $Token -Encoding ASCII
-  }
-
   $Existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   if ($Existing) {
     Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue
     & sc.exe delete $ServiceName | Out-Null
-    Start-Sleep -Seconds 1
+    for ($i = 0; $i -lt 20; $i++) {
+      Start-Sleep -Milliseconds 500
+      if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { break }
+    }
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { Fail '旧 zeno-agent 服务删除超时' }
+  }
+
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Bin), (Split-Path -Parent $TokenFile) | Out-Null
+  Copy-Item -Force -Path $Found.FullName -Destination $Bin
+  if ($Token) {
+    Set-Content -Path $TokenFile -Value $Token -Encoding ASCII
   }
 
   $Args = @(
@@ -75,7 +79,8 @@ try {
   )
   $QuotedArgs = $Args | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }
   $BinPath = '"' + $Bin + '" ' + ($QuotedArgs -join ' ')
-  & sc.exe create $ServiceName binPath= $BinPath start= auto DisplayName= 'Zeno Agent' | Out-Null
+  New-Service -Name $ServiceName -BinaryPathName $BinPath -DisplayName 'Zeno Agent' -StartupType Automatic | Out-Null
+  if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
   & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
   Start-Service -Name $ServiceName
   $Started = Get-Service -Name $ServiceName
