@@ -58,21 +58,6 @@ func TestReportOnceAddsDiscoveredNetworkIdentityToHost(t *testing.T) {
 	}
 }
 
-func TestReportJitterStaggersNodesWithinInterval(t *testing.T) {
-	interval := 2 * time.Second
-	first := reportJitter("hytron", interval)
-	second := reportJitter("sharon", interval)
-	if first < 0 || first >= interval || second < 0 || second >= interval {
-		t.Fatalf("jitter outside interval: first=%s second=%s interval=%s", first, second, interval)
-	}
-	if first == second {
-		t.Fatalf("jitter should stagger different node ids, both got %s", first)
-	}
-	if got := reportJitter("hytron", interval); got != first {
-		t.Fatalf("jitter must be deterministic, got %s then %s", first, got)
-	}
-}
-
 func TestReportStateOnlyPostsStateWithoutHeartbeatOrProbeFetch(t *testing.T) {
 	var statePosts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,39 +78,6 @@ func TestReportStateOnlyPostsStateWithoutHeartbeatOrProbeFetch(t *testing.T) {
 	}
 	if statePosts != 1 {
 		t.Fatalf("state posts = %d, want 1", statePosts)
-	}
-}
-
-func TestRunKeepsStateTickerWhileFullReportIsBlocked(t *testing.T) {
-	var statePosts int
-	blockProbeResults := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/agent/v1/state":
-			statePosts++
-			w.WriteHeader(http.StatusAccepted)
-		case "/api/agent/v1/heartbeat", "/api/agent/v1/host":
-			w.WriteHeader(http.StatusAccepted)
-		case "/api/agent/v1/probe-targets":
-			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Targets: []agent.ProbeTarget{{ID: "blocked", Type: "unsupported", Count: 1, IntervalSec: 1}}})
-		case "/api/agent/v1/probe-results":
-			<-blockProbeResults
-			w.WriteHeader(http.StatusAccepted)
-		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-	defer close(blockProbeResults)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 260*time.Millisecond)
-	defer cancel()
-	err := run(ctx, config{ControllerURL: server.URL, NodeID: "hytron", Token: "token", Interval: 50 * time.Millisecond, Version: "test"})
-	if err == nil || err != context.DeadlineExceeded {
-		t.Fatalf("run error = %v, want context deadline exceeded", err)
-	}
-	if statePosts < 3 {
-		t.Fatalf("state posts = %d, want state ticker to continue while full report is blocked", statePosts)
 	}
 }
 

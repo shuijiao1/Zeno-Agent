@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"flag"
-	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shuijiao1/Zeno-Agent/internal/agent"
@@ -62,75 +60,40 @@ func run(ctx context.Context, cfg config) error {
 	collector := agent.NewMetricsCollector()
 	scheduler := agent.NewProbeScheduler()
 	identityDiscoverer := agent.NewCachedNetworkIdentityDiscoverer(agent.NewNetworkIdentityDiscoverer(), cfg.IdentityRefreshInterval)
+	if err := reportOnce(ctx, client, collector, cfg.Version, true, scheduler, identityDiscoverer); err != nil {
+		return err
+	}
 	if cfg.Once {
-		return reportOnce(ctx, client, collector, cfg.Version, true, scheduler, identityDiscoverer)
+		return nil
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultReportInterval
 	}
-	if err := reportStateOnly(ctx, client, collector); err != nil {
-		return err
-	}
-
-	var fullReportMu sync.Mutex
-	fullReportRunning := false
-	startFullReport := func() {
-		fullReportMu.Lock()
-		if fullReportRunning {
-			fullReportMu.Unlock()
-			return
-		}
-		fullReportRunning = true
-		fullReportMu.Unlock()
-		go func() {
-			defer func() {
-				fullReportMu.Lock()
-				fullReportRunning = false
-				fullReportMu.Unlock()
-			}()
-			if err := reportFull(ctx, client, collector, cfg.Version, true, scheduler, identityDiscoverer); err != nil && ctx.Err() == nil {
-				log.Printf("full report failed: %v", err)
-			}
-		}()
-	}
-	startFullReport()
-	if delay := reportJitter(cfg.NodeID, cfg.Interval); delay > 0 {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
-		}
-	}
-
-	stateTicker := time.NewTicker(cfg.Interval)
-	defer stateTicker.Stop()
-	fullTicker := time.NewTicker(defaultFullReportInterval)
-	defer fullTicker.Stop()
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	lastFullReport := time.Now().UTC()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-stateTicker.C:
-			if err := reportStateOnly(ctx, client, collector); err != nil {
-				log.Printf("state report failed: %v", err)
+		case tick := <-ticker.C:
+			if !tick.UTC().Before(lastFullReport.Add(defaultFullReportInterval)) {
+				if err := reportOnce(ctx, client, collector, cfg.Version, true, scheduler, identityDiscoverer); err != nil {
+					log.Printf("report failed: %v", err)
+				} else {
+					lastFullReport = tick.UTC()
+				}
+				continue
 			}
-		case <-fullTicker.C:
-			startFullReport()
+			if err := reportStateOnly(ctx, client, collector); err != nil {
+				log.Printf("report failed: %v", err)
+			}
 		}
 	}
 }
 
 type networkIdentityDiscoverer interface {
 	Discover(context.Context) agent.NetworkIdentity
-}
-
-func reportJitter(nodeID string, interval time.Duration) time.Duration {
-	if interval <= 0 {
-		return 0
-	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(strings.TrimSpace(nodeID)))
-	return time.Duration(h.Sum64() % uint64(interval))
 }
 
 func reportOnce(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector, version string, includeHost bool, scheduler *agent.ProbeScheduler, identityDiscoverer networkIdentityDiscoverer) error {
@@ -171,44 +134,6 @@ func reportOnce(ctx context.Context, client *agent.Client, collector *agent.Metr
 		}
 	}
 	log.Printf("reported host/state and %d probe target(s)", len(dueTargets))
-	return nil
-}
-
-func reportFull(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector, version string, includeHost bool, scheduler *agent.ProbeScheduler, identityDiscoverer networkIdentityDiscoverer) error {
-	now := time.Now().UTC()
-	if err := client.PostHeartbeat(ctx, "online", version, now); err != nil {
-		return err
-	}
-	if includeHost {
-		host := collector.CollectHost(version)
-		if identityDiscoverer != nil {
-			identity := identityDiscoverer.Discover(ctx)
-			host.PublicIPv4 = identity.PublicIPv4
-			host.PublicIPv6 = identity.PublicIPv6
-			host.CountryCode = identity.CountryCode
-		}
-		if err := client.PostHost(ctx, host); err != nil {
-			return err
-		}
-	}
-	targets, err := client.FetchProbeTargets(ctx)
-	if err != nil {
-		return err
-	}
-	dueTargets := targets
-	if scheduler != nil {
-		dueTargets = scheduler.Due(targets, now)
-	}
-	if len(dueTargets) > 0 {
-		rounds := agent.ProbeTargets(ctx, dueTargets, now)
-		if err := client.PostProbeResults(ctx, rounds); err != nil {
-			return err
-		}
-		if scheduler != nil {
-			scheduler.MarkCompleted(dueTargets, now)
-		}
-	}
-	log.Printf("reported host and %d probe target(s)", len(dueTargets))
 	return nil
 }
 
