@@ -4,17 +4,22 @@ package agent
 
 import "golang.org/x/sys/unix"
 
-func diskUsage(path string) (used int64, total int64) {
-	if path == "" || path == "/" {
-		for _, candidate := range []string{"/System/Volumes/Data", "/"} {
-			used, total = diskUsageForPath(candidate)
-			if total > 0 {
-				return used, total
-			}
+func diskUsage(allowlist []string) (used int64, total int64) {
+	if len(allowlist) > 0 {
+		for _, path := range normalizeAllowlist(allowlist) {
+			pathUsed, pathTotal := diskUsageForPath(path)
+			used += pathUsed
+			total += pathTotal
 		}
-		return 0, 0
+		return used, total
 	}
-	return diskUsageForPath(path)
+	for _, candidate := range []string{"/System/Volumes/Data", "/"} {
+		used, total = diskUsageForPath(candidate)
+		if total > 0 {
+			return used, total
+		}
+	}
+	return 0, 0
 }
 
 func diskUsageForPath(path string) (used int64, total int64) {

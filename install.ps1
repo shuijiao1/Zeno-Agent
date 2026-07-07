@@ -9,6 +9,8 @@ $ControllerURL = $env:ZENO_CONTROLLER_URL
 $NodeID = $env:ZENO_NODE_ID
 $Token = $env:ZENO_AGENT_TOKEN
 $Interval = if ($env:ZENO_AGENT_INTERVAL) { $env:ZENO_AGENT_INTERVAL } else { '2s' }
+$NetworkInterfaces = $env:ZENO_AGENT_NETWORK_INTERFACES
+$DiskMounts = $env:ZENO_AGENT_DISK_MOUNTS
 $ServiceName = if ($env:ZENO_AGENT_SERVICE_NAME) { $env:ZENO_AGENT_SERVICE_NAME } else { 'zeno-agent' }
 
 function Fail($Message) {
@@ -77,6 +79,8 @@ try {
     '-interval', $Interval,
     '-version', $Version
   )
+  if ($NetworkInterfaces) { $Args += @('-network-interfaces', $NetworkInterfaces) }
+  if ($DiskMounts) { $Args += @('-disk-mounts', $DiskMounts) }
   $QuotedArgs = $Args | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }
   $BinPath = '"' + $Bin + '" ' + ($QuotedArgs -join ' ')
   New-Service -Name $ServiceName -BinaryPathName $BinPath -DisplayName 'Zeno Agent' -StartupType Automatic | Out-Null

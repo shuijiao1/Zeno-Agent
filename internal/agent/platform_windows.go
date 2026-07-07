@@ -18,6 +18,12 @@ var getTickCount64 = kernel32.NewProc("GetTickCount64")
 var getIfTable2Ex = iphlpapi.NewProc("GetIfTable2Ex")
 var freeMibTable = iphlpapi.NewProc("FreeMibTable")
 
+const (
+	windowsIfHardwareInterface = 1 << 0
+	windowsIfFilterInterface   = 1 << 1
+	windowsIfEndPointInterface = 1 << 7
+)
+
 type filetime struct {
 	LowDateTime  uint32
 	HighDateTime uint32
@@ -79,11 +85,11 @@ func windowsProcessCount() int64 {
 	return count
 }
 
-func windowsNetworkTotals() networkTotals {
+func windowsNetworkTotals(allowlist map[string]struct{}) networkTotals {
 	var table *mibIfTable2
 	result, _, _ := getIfTable2Ex.Call(uintptr(windows.MibIfEntryNormal), uintptr(unsafe.Pointer(&table)))
 	if result != 0 || table == nil {
-		return windowsNetworkTotalsLegacy()
+		return windowsNetworkTotalsLegacy(allowlist)
 	}
 	defer freeMibTable.Call(uintptr(unsafe.Pointer(table)))
 
@@ -92,7 +98,7 @@ func windowsNetworkTotals() networkTotals {
 	base := uintptr(unsafe.Pointer(&table.Table[0]))
 	for index := uint32(0); index < table.NumEntries; index++ {
 		row := (*windows.MibIfRow2)(unsafe.Pointer(base + uintptr(index)*rowSize))
-		if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+		if !includeWindowsNetworkRow(row, allowlist) {
 			continue
 		}
 		totals.InBytes += int64(row.InOctets)
@@ -101,7 +107,7 @@ func windowsNetworkTotals() networkTotals {
 	return totals
 }
 
-func windowsNetworkTotalsLegacy() networkTotals {
+func windowsNetworkTotalsLegacy(allowlist map[string]struct{}) networkTotals {
 	var size uint32 = 15 * 1024
 	buffer := make([]byte, size)
 	err := windows.GetAdaptersInfo((*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])), &size)
@@ -118,13 +124,57 @@ func windowsNetworkTotalsLegacy() networkTotals {
 		if err := windows.GetIfEntry(&row); err != nil {
 			continue
 		}
-		if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+		if !includeWindowsLegacyNetworkRow(&row, allowlist) {
 			continue
 		}
 		totals.InBytes += int64(row.InOctets)
 		totals.OutBytes += int64(row.OutOctets)
 	}
 	return totals
+}
+
+func includeWindowsNetworkRow(row *windows.MibIfRow2, allowlist map[string]struct{}) bool {
+	alias := strings.TrimSpace(windows.UTF16ToString(row.Alias[:]))
+	description := strings.TrimSpace(windows.UTF16ToString(row.Description[:]))
+	if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+		return false
+	}
+	if len(allowlist) > 0 {
+		_, aliasOK := allowlist[alias]
+		_, descriptionOK := allowlist[description]
+		return aliasOK || descriptionOK
+	}
+	if alias != "" && !includeNetworkInterface(alias, nil) {
+		return false
+	}
+	if description != "" && !includeNetworkInterface(description, nil) {
+		return false
+	}
+	flags := row.InterfaceAndOperStatusFlags
+	if flags&windowsIfHardwareInterface == 0 {
+		return false
+	}
+	if flags&(windowsIfFilterInterface|windowsIfEndPointInterface) != 0 {
+		return false
+	}
+	return row.PhysicalAddressLength > 0
+}
+
+func includeWindowsLegacyNetworkRow(row *windows.MibIfRow, allowlist map[string]struct{}) bool {
+	if len(allowlist) > 0 {
+		name := strings.TrimSpace(windows.UTF16ToString(row.Name[:]))
+		_, ok := allowlist[name]
+		return ok
+	}
+	if row.Type == windows.IF_TYPE_SOFTWARE_LOOPBACK || row.OperStatus != windows.IfOperStatusUp {
+		return false
+	}
+	switch row.Type {
+	case windows.IF_TYPE_ETHERNET_CSMACD, windows.IF_TYPE_IEEE80211, windows.IF_TYPE_PPP:
+		return true
+	default:
+		return false
+	}
 }
 
 func windowsOSRelease() (string, string) {

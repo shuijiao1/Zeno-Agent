@@ -10,6 +10,8 @@ CONTROLLER_URL="${ZENO_CONTROLLER_URL:-}"
 NODE_ID="${ZENO_NODE_ID:-}"
 TOKEN="${ZENO_AGENT_TOKEN:-}"
 INTERVAL="${ZENO_AGENT_INTERVAL:-2s}"
+NETWORK_INTERFACES="${ZENO_AGENT_NETWORK_INTERFACES:-}"
+DISK_MOUNTS="${ZENO_AGENT_DISK_MOUNTS:-}"
 
 fail() {
   echo "错误: $*" >&2
@@ -89,6 +91,14 @@ if [ -z "$TOKEN_FILE" ]; then
   esac
 fi
 
+extra_args=()
+if [ -n "$NETWORK_INTERFACES" ]; then
+  extra_args+=("-network-interfaces" "$NETWORK_INTERFACES")
+fi
+if [ -n "$DISK_MOUNTS" ]; then
+  extra_args+=("-disk-mounts" "$DISK_MOUNTS")
+fi
+
 install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
 install -m 755 "$FOUND" "$BIN"
 if [ -n "$TOKEN" ]; then
@@ -102,6 +112,11 @@ if [ "$GOOS" = "darwin" ]; then
   xml_escape() {
     printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
   }
+  plist_extra_args=""
+  for arg in "${extra_args[@]}"; do
+    plist_extra_args="${plist_extra_args}    <string>$(xml_escape "$arg")</string>
+"
+  done
   cat > "$PLIST" <<EOF_PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -116,6 +131,7 @@ if [ "$GOOS" = "darwin" ]; then
     <string>-token-file</string><string>$(xml_escape "$TOKEN_FILE")</string>
     <string>-interval</string><string>$(xml_escape "$INTERVAL")</string>
     <string>-version</string><string>$(xml_escape "$VERSION")</string>
+${plist_extra_args}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -131,6 +147,10 @@ EOF_PLIST
   launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
   launchctl kickstart -k system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
 else
+  systemd_extra_args=""
+  if [ "${#extra_args[@]}" -gt 0 ]; then
+    printf -v systemd_extra_args ' %q' "${extra_args[@]}"
+  fi
   cat > /etc/systemd/system/zeno-agent.service <<EOF_SERVICE
 [Unit]
 Description=Zeno Agent
@@ -139,7 +159,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN -controller-url $CONTROLLER_URL -node-id $NODE_ID -token-file $TOKEN_FILE -interval $INTERVAL -version $VERSION
+ExecStart=$BIN -controller-url $CONTROLLER_URL -node-id $NODE_ID -token-file $TOKEN_FILE -interval $INTERVAL -version $VERSION${systemd_extra_args}
 Restart=always
 RestartSec=5s
 

@@ -34,6 +34,8 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_AGENT_TOKEN`：该节点 token
 - `ZENO_AGENT_VERSION`：默认 `latest`，可固定为 `v0.1.0`
 - `ZENO_AGENT_INTERVAL`：状态上报间隔，默认 `2s`
+- `ZENO_AGENT_NETWORK_INTERFACES`：网络接口 allowlist，逗号分隔；默认排除 Docker/veth/br-/tun/tailscale/kube/vmbr/tap 等虚拟接口
+- `ZENO_AGENT_DISK_MOUNTS`：磁盘统计路径 allowlist，逗号分隔；默认汇总真实文件系统分区并排除 overlay/tmpfs/proc/sysfs/docker/kubelet 等挂载
 - `ZENO_AGENT_TOKEN_FILE`：token 文件路径，默认 `/etc/zeno/agent-token`
 - `ZENO_AGENT_BIN`：二进制安装路径，默认 `/usr/local/bin/zeno-agent`
 

@@ -10,20 +10,34 @@ import (
 )
 
 type MetricsCollector struct {
-	previousCPU   cpuTimes
-	hasCPU        bool
-	previousNet   networkTotals
-	previousNetAt time.Time
-	hasNet        bool
+	previousCPU      cpuTimes
+	hasCPU           bool
+	previousNet      networkTotals
+	previousNetAt    time.Time
+	hasNet           bool
+	networkAllowlist map[string]struct{}
+	diskAllowlist    []string
 }
 
-func NewMetricsCollector() *MetricsCollector {
-	return &MetricsCollector{}
+type MetricsOptions struct {
+	NetworkInterfaceAllowlist []string
+	DiskMountAllowlist        []string
+}
+
+func NewMetricsCollector(options ...MetricsOptions) *MetricsCollector {
+	var opts MetricsOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	return &MetricsCollector{
+		networkAllowlist: allowlistSet(opts.NetworkInterfaceAllowlist),
+		diskAllowlist:    normalizeAllowlist(opts.DiskMountAllowlist),
+	}
 }
 
 func (c *MetricsCollector) CollectHost(version string) HostInfo {
 	memTotal, _ := readMemoryTotals()
-	_, diskTotal := diskUsage("/")
+	_, diskTotal := diskUsage(c.diskAllowlist)
 	hostname, _ := os.Hostname()
 	osName, osVersion := osRelease()
 	return HostInfo{
@@ -47,8 +61,8 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 	memTotal, memAvailable := readMemoryTotals()
 	swapTotal, swapFree := readSwapTotals()
 	load1, load5, load15 := readLoadAverages(cpu, runtime.NumCPU())
-	diskUsed, diskTotal := diskUsage("/")
-	netTotals := readNetworkTotals()
+	diskUsed, diskTotal := diskUsage(c.diskAllowlist)
+	netTotals := readNetworkTotals(c.networkAllowlist)
 	var inSpeed, outSpeed float64
 	if c.hasNet {
 		elapsed := now.Sub(c.previousNetAt).Seconds()
@@ -262,9 +276,37 @@ type networkTotals struct {
 	OutBytes int64
 }
 
-func readNetworkTotals() networkTotals {
+var defaultExcludedInterfacePrefixes = []string{
+	"lo",
+	"docker",
+	"veth",
+	"br-",
+	"tun",
+	"tailscale",
+	"kube",
+	"vmbr",
+	"tap",
+	"cni",
+	"flannel",
+	"cali",
+	"weave",
+	"virbr",
+	"vnet",
+	"vethernet",
+	"virtualbox",
+	"vmware",
+	"hyper-v",
+	"loopback",
+	"isatap",
+	"teredo",
+	"npcap",
+	"bluetooth",
+	"zt",
+}
+
+func readNetworkTotals(allowlist map[string]struct{}) networkTotals {
 	if runtime.GOOS == "windows" {
-		return windowsNetworkTotals()
+		return windowsNetworkTotals(allowlist)
 	}
 	content, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
@@ -279,7 +321,7 @@ func readNetworkTotals() networkTotals {
 		}
 		iface, rest, _ := strings.Cut(line, ":")
 		iface = strings.TrimSpace(iface)
-		if iface == "lo" {
+		if !includeNetworkInterface(iface, allowlist) {
 			continue
 		}
 		fields := strings.Fields(rest)
@@ -292,6 +334,53 @@ func readNetworkTotals() networkTotals {
 		totals.OutBytes += outBytes
 	}
 	return totals
+}
+
+func normalizeAllowlist(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func allowlistSet(values []string) map[string]struct{} {
+	list := normalizeAllowlist(values)
+	if len(list) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(list))
+	for _, value := range list {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func includeNetworkInterface(name string, allowlist map[string]struct{}) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	if len(allowlist) > 0 {
+		_, ok := allowlist[trimmed]
+		return ok
+	}
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range defaultExcludedInterfacePrefixes {
+		if lower == prefix || strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 func osRelease() (string, string) {

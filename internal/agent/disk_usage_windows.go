@@ -15,11 +15,22 @@ var getDriveType = kernel32.NewProc("GetDriveTypeW")
 
 const driveFixed = 3
 
-func diskUsage(path string) (used int64, total int64) {
-	if path == "/" || path == "" {
+func diskUsage(allowlist []string) (used int64, total int64) {
+	if len(allowlist) == 0 {
 		return fixedDiskUsage()
 	}
-	return diskUsageForRoot(windowsVolumeRoot(path))
+	seen := map[string]struct{}{}
+	for _, path := range normalizeAllowlist(allowlist) {
+		root := windowsVolumeRoot(path)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		driveUsed, driveTotal := diskUsageForRoot(root)
+		used += driveUsed
+		total += driveTotal
+	}
+	return used, total
 }
 
 func fixedDiskUsage() (used int64, total int64) {
