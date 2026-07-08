@@ -31,7 +31,7 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_CONTROLLER_URL`：Controller 公网地址，例如 `https://zeno.shuijiao.li`
 - `ZENO_NODE_ID`：后台服务器 ID
 - `ZENO_AGENT_TOKEN`：该节点 token
-- `ZENO_AGENT_VERSION`：默认 `latest`，可固定为当前稳定版，例如 `v0.1.11`
+- `ZENO_AGENT_VERSION`：默认 `latest`，一般不需要设置
 - `ZENO_AGENT_STATE_INTERVAL`：实时资源 state 上报间隔，默认 `3s`；旧 `ZENO_AGENT_INTERVAL` 仍作为兼容别名
 - `ZENO_AGENT_HEARTBEAT_INTERVAL`：heartbeat 上报间隔，默认 `15s`，用于 last_seen/debug
 - `ZENO_AGENT_HOST_INTERVAL`：静态机器信息上报间隔，默认 `30m`
