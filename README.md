@@ -21,7 +21,6 @@ curl -fsSL https://raw.githubusercontent.com/shuijiao1/Zeno-Agent/main/install.s
   ZENO_CONTROLLER_URL=https://zeno.example.com \
   ZENO_NODE_ID=<node-id> \
   ZENO_AGENT_TOKEN=<agent-token> \
-  ZENO_AGENT_VERSION=v0.1.0 \
   bash
 ```
 
@@ -32,7 +31,7 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_CONTROLLER_URL`：Controller 公网地址，例如 `https://zeno.shuijiao.li`
 - `ZENO_NODE_ID`：后台服务器 ID
 - `ZENO_AGENT_TOKEN`：该节点 token
-- `ZENO_AGENT_VERSION`：默认 `latest`，可固定为 `v0.1.0`
+- `ZENO_AGENT_VERSION`：默认 `latest`，可固定为当前稳定版，例如 `v0.1.11`
 - `ZENO_AGENT_STATE_INTERVAL`：实时资源 state 上报间隔，默认 `3s`；旧 `ZENO_AGENT_INTERVAL` 仍作为兼容别名
 - `ZENO_AGENT_HEARTBEAT_INTERVAL`：heartbeat 上报间隔，默认 `15s`，用于 last_seen/debug
 - `ZENO_AGENT_HOST_INTERVAL`：静态机器信息上报间隔，默认 `30m`
@@ -42,7 +41,7 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_AGENT_TOKEN_FILE`：token 文件路径，默认 `/etc/zeno/agent-token`
 - `ZENO_AGENT_BIN`：二进制安装路径，默认 `/usr/local/bin/zeno-agent`
 
-Linux 安装脚本会写入 / 更新 `zeno-agent.service`；macOS 会写入 `/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist`；Windows 会注册 `zeno-agent` 服务。安装脚本不会安装 Controller，也不会修改业务服务。
+Linux 安装脚本会写入 / 更新 `zeno-agent.service`；macOS 会写入 `/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist`；Windows 会注册 `zeno-agent` 服务。安装脚本可重复执行，会保留已有 token 文件；安装脚本不会安装 Controller，也不会修改业务服务。
 
 ## 手动构建
 
