@@ -116,3 +116,12 @@ func TestProbeTargetsRunsHTTPGETTargetsInsteadOfMarkingUnsupported(t *testing.T)
 		t.Fatalf("http sample = %+v, want successful latency sample", rounds[0].Samples[0])
 	}
 }
+
+func TestLatencyObservationTimeoutHasHardFiveSecondCap(t *testing.T) {
+	if got := latencyObservationTimeout(12 * time.Second); got != 5*time.Second {
+		t.Fatalf("long target observation timeout = %s, want 5s", got)
+	}
+	if got := latencyObservationTimeout(500 * time.Millisecond); got != 5*time.Second {
+		t.Fatalf("short target observation timeout = %s, want 5s to retain slow timeout latency", got)
+	}
+}

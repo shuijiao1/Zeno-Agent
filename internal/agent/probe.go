@@ -162,10 +162,11 @@ func normalizedProbeTimeout(timeoutMS int) time.Duration {
 }
 
 func latencyObservationTimeout(timeout time.Duration) time.Duration {
-	if timeout < drawableLatencyCap {
-		return drawableLatencyCap
-	}
-	return timeout
+	// Five seconds is both the chart cap and the hard observation ceiling.
+	// Shorter configured timeouts still get the full observation window so a
+	// 1–5s timeout can retain its measured latency, but no probe may block the
+	// scheduler indefinitely because of an oversized target timeout.
+	return drawableLatencyCap
 }
 
 func measuredProbeSample(seq int, elapsedMS float64, timeout time.Duration) ProbeSample {
