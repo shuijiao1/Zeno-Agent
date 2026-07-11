@@ -6,60 +6,57 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            ext: ''
-            archive: tar.gz
-          - goos: linux
-            goarch: arm64
-            ext: ''
-            archive: tar.gz
-          - goos: linux
-            goarch: arm
-            ext: ''
-            archive: tar.gz
-          - goos: darwin
-            goarch: amd64
-            ext: ''
-            archive: tar.gz
-          - goos: darwin
-            goarch: arm64
-            ext: ''
-            archive: tar.gz
-          - goos: windows
-            goarch: amd64
-            ext: '.exe'
-            archive: zip
-          - goos: windows
-            goarch: arm64
-            ext: '.exe'
-            archive: zip
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.12'
+          check-latest: true
+      - run: go mod tidy
+      - run: git diff --exit-code -- go.mod go.sum
       - run: go test ./...
-      - name: Build
+      - run: go vet ./...
+      - name: Build release assets
         run: |
-          mkdir -p dist/zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }}
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags "-s -w" -o dist/zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }}/zeno-agent${{ matrix.ext }} ./cmd/zeno-agent
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && zip -qr zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }})
-          else
-            tar -C dist -czf dist/zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz zeno-agent_${{ matrix.goos }}_${{ matrix.goarch }}
-          fi
-      - uses: softprops/action-gh-release@v2
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            ext=""
+            archive="tar.gz"
+            if [ "$goos" = "windows" ]; then
+              ext=".exe"
+              archive="zip"
+            fi
+            out_dir="dist/zeno-agent_${goos}_${goarch}"
+            mkdir -p "$out_dir"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+            if [ "$archive" = "zip" ]; then
+              (cd dist && zip -qr "zeno-agent_${goos}_${goarch}.zip" "zeno-agent_${goos}_${goarch}")
+            else
+              tar -C dist -czf "dist/zeno-agent_${goos}_${goarch}.tar.gz" "zeno-agent_${goos}_${goarch}"
+            fi
+          done
+          (cd dist && sha256sum zeno-agent_*.tar.gz zeno-agent_*.zip > SHA256SUMS)
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/SHA256SUMS

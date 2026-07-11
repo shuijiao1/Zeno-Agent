@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -102,5 +104,64 @@ func TestCachedNetworkIdentityDiscovererKeepsLastIdentityOnFullFailure(t *testin
 	second := cached.Discover(context.Background())
 	if second != first {
 		t.Fatalf("second identity = %+v, want cached identity %+v after provider failure", second, first)
+	}
+}
+
+func TestNetworkIdentityDiscovererRejectsOversizedJSONBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		padding := make([]byte, networkIdentityMaxJSONBodyBytes)
+		for index := range padding {
+			padding[index] = 'a'
+		}
+		_, _ = fmt.Fprintf(w, `{"ip":"203.0.113.10","padding":"%s"}`, string(padding))
+	}))
+	defer server.Close()
+
+	discoverer := &NetworkIdentityDiscoverer{
+		Client:  server.Client(),
+		IPv4URL: server.URL,
+	}
+
+	identity := discoverer.Discover(context.Background())
+	if identity.PublicIPv4 != "" || identity.PublicIPv6 != "" || identity.CountryCode != "" {
+		t.Fatalf("identity = %+v, want oversized provider response ignored", identity)
+	}
+}
+
+func TestNetworkIdentityDiscovererRejectsUntrustedRedirect(t *testing.T) {
+	var leakHits int
+	leakServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits++
+		w.Write([]byte(`{"ip":"203.0.113.10"}`))
+	}))
+	defer leakServer.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leakServer.URL, http.StatusFound)
+	}))
+	defer server.Close()
+
+	discoverer := &NetworkIdentityDiscoverer{
+		Client:  server.Client(),
+		IPv4URL: server.URL,
+	}
+
+	identity := discoverer.Discover(context.Background())
+	if identity.PublicIPv4 != "" || identity.PublicIPv6 != "" || identity.CountryCode != "" {
+		t.Fatalf("identity = %+v, want redirected provider response ignored", identity)
+	}
+	if leakHits != 0 {
+		t.Fatalf("untrusted redirect target was requested %d time(s), want 0", leakHits)
+	}
+}
+
+func TestNetworkIdentityRejectsHTTPDNSNameStartingWith127(t *testing.T) {
+	parsed, err := url.Parse("http://127.evil.example/identity")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	if identityProviderURLAllowed(parsed) {
+		t.Fatal("HTTP DNS hostname starting with 127. was treated as a loopback address")
 	}
 }

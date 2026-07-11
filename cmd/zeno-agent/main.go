@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -213,6 +214,7 @@ func reportOnce(ctx context.Context, client *agent.Client, collector *agent.Metr
 	if scheduler != nil {
 		dueTargets = scheduler.Due(targets, now)
 	}
+	dueTargets = agent.LimitProbeTargetsForRun(dueTargets)
 	if len(dueTargets) > 0 {
 		rounds := agent.ProbeTargets(ctx, dueTargets, now)
 		if err := client.PostProbeResults(ctx, rounds); err != nil {
@@ -231,10 +233,17 @@ func reportStateOnly(ctx context.Context, client *agent.Client, collector *agent
 }
 
 type probeTargetManager struct {
-	mu        sync.Mutex
-	targets   []agent.ProbeTarget
-	version   int64
-	scheduler *agent.ProbeScheduler
+	mu         sync.Mutex
+	targets    []agent.ProbeTarget
+	version    int64
+	generation uint64
+	scheduler  *agent.ProbeScheduler
+}
+
+type probeTargetBatch struct {
+	targets    []agent.ProbeTarget
+	version    int64
+	generation uint64
 }
 
 func newProbeTargetManager() *probeTargetManager {
@@ -244,33 +253,49 @@ func newProbeTargetManager() *probeTargetManager {
 func (m *probeTargetManager) update(targets []agent.ProbeTarget, version int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.targets = append(m.targets[:0], targets...)
-	if version != 0 && version != m.version {
+	sanitized := agent.SanitizeProbeTargets(targets)
+	changed := version != m.version || !sameProbeTargets(m.targets, sanitized)
+	m.targets = append(m.targets[:0], sanitized...)
+	if changed {
 		m.scheduler = agent.NewProbeScheduler()
 		m.version = version
+		m.generation++
 	}
 }
 
-func (m *probeTargetManager) due(now time.Time) []agent.ProbeTarget {
+func (m *probeTargetManager) due(now time.Time) probeTargetBatch {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.targets) == 0 {
-		return nil
+		return probeTargetBatch{version: m.version, generation: m.generation}
 	}
-	due := m.scheduler.Due(m.targets, now)
-	return append([]agent.ProbeTarget(nil), due...)
+	due := agent.LimitProbeTargetsForRun(m.scheduler.Due(m.targets, now))
+	return probeTargetBatch{targets: append([]agent.ProbeTarget(nil), due...), version: m.version, generation: m.generation}
 }
 
-func (m *probeTargetManager) markCompleted(targets []agent.ProbeTarget, now time.Time) {
+func (m *probeTargetManager) isCurrent(batch probeTargetBatch) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.scheduler.MarkCompleted(targets, now)
+	return batch.generation == m.generation && batch.version == m.version
 }
 
-func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *probeTargetManager, _ int64) (int64, error) {
+func (m *probeTargetManager) markCompleted(batch probeTargetBatch, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if batch.generation != m.generation || batch.version != m.version {
+		return false
+	}
+	m.scheduler.MarkCompleted(batch.targets, now)
+	return true
+}
+
+func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *probeTargetManager, requestedVersion int64) (int64, error) {
 	response, err := client.FetchProbeConfig(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if requestedVersion > 0 && response.Version < requestedVersion {
+		return 0, fmt.Errorf("probe config version %d is older than requested version %d", response.Version, requestedVersion)
 	}
 	manager.update(response.Targets, response.Version)
 	return response.Version, nil
@@ -278,16 +303,47 @@ func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *pro
 
 func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTargetManager) error {
 	now := time.Now().UTC()
-	dueTargets := manager.due(now)
-	if len(dueTargets) == 0 {
+	batch := manager.due(now)
+	if len(batch.targets) == 0 {
 		return nil
 	}
-	rounds := agent.ProbeTargets(ctx, dueTargets, now)
+	rounds := agent.ProbeTargets(ctx, batch.targets, now)
+	for index := range rounds {
+		rounds[index].ConfigVersion = batch.version
+	}
+	if !manager.isCurrent(batch) {
+		log.Printf("probe config changed while probes were running; discarded %d stale result round(s) for version %d", len(rounds), batch.version)
+		return nil
+	}
 	if err := client.PostProbeResults(ctx, rounds); err != nil {
 		return err
 	}
-	manager.markCompleted(dueTargets, now)
+	if !manager.markCompleted(batch, now) {
+		log.Printf("probe config changed while probe results were uploading; skipped stale completion mark for version %d", batch.version)
+	}
 	return nil
+}
+
+func sameProbeTargets(left, right []agent.ProbeTarget) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !sameProbeTarget(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameProbeTarget(left, right agent.ProbeTarget) bool {
+	if left.ID != right.ID || left.Name != right.Name || left.Type != right.Type || left.Address != right.Address || left.Count != right.Count || left.TimeoutMS != right.TimeoutMS || left.IntervalSec != right.IntervalSec {
+		return false
+	}
+	if left.Port == nil || right.Port == nil {
+		return left.Port == nil && right.Port == nil
+	}
+	return *left.Port == *right.Port
 }
 
 func splitCommaList(value string) []string {

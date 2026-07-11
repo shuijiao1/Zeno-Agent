@@ -4,12 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
+
+const networkIdentityMaxJSONBodyBytes int64 = 4 * 1024
+
+var trustedNetworkIdentityHosts = map[string]struct{}{
+	"api.ipify.org":  {},
+	"api6.ipify.org": {},
+	"ipwho.is":       {},
+}
 
 // NetworkIdentity contains auto-discovered public network metadata for a node.
 // Empty fields mean discovery failed or the host does not have that address family.
@@ -103,12 +113,34 @@ func (d *NetworkIdentityDiscoverer) fetchCountryCode(ctx context.Context, client
 }
 
 func (d *NetworkIdentityDiscoverer) fetchJSON(ctx context.Context, client *http.Client, url string, target any) error {
+	parsed, err := urlpkgParse(url)
+	if err != nil {
+		return err
+	}
+	if !identityProviderURLAllowed(parsed) {
+		return fmt.Errorf("identity provider url is not trusted: %s", parsed.Redacted())
+	}
+	requestClient := *client
+	baseCheckRedirect := client.CheckRedirect
+	originHost := parsed.Hostname()
+	requestClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("identity provider redirect limit exceeded")
+		}
+		if !identityProviderRedirectAllowed(req.URL, originHost) {
+			return fmt.Errorf("identity provider redirect is not trusted: %s", req.URL.Redacted())
+		}
+		if baseCheckRedirect != nil {
+			return baseCheckRedirect(req, via)
+		}
+		return nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", "Zeno-Agent")
-	resp, err := client.Do(req)
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -116,7 +148,59 @@ func (d *NetworkIdentityDiscoverer) fetchJSON(ctx context.Context, client *http.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("identity provider returned %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, networkIdentityMaxJSONBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > networkIdentityMaxJSONBodyBytes {
+		return fmt.Errorf("identity provider response exceeds %d bytes", networkIdentityMaxJSONBodyBytes)
+	}
+	return json.Unmarshal(body, target)
+}
+
+func urlpkgParse(value string) (*url.URL, error) {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("identity provider url must be absolute")
+	}
+	return parsed, nil
+}
+
+func identityProviderURLAllowed(parsed *url.URL) bool {
+	if parsed == nil {
+		return false
+	}
+	if parsed.Scheme == "https" {
+		return true
+	}
+	return parsed.Scheme == "http" && isLocalIdentityProviderHost(parsed.Hostname())
+}
+
+func identityProviderRedirectAllowed(parsed *url.URL, originHost string) bool {
+	if parsed == nil || parsed.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == strings.ToLower(originHost) {
+		return true
+	}
+	_, ok := trustedNetworkIdentityHosts[host]
+	return ok
+}
+
+func isLocalIdentityProviderHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // CachedNetworkIdentityDiscoverer prevents Agent host reports from calling public

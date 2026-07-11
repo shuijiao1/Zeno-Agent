@@ -24,37 +24,105 @@ type PresenceClientMessage struct {
 type PresenceConfigHandler func(ctx context.Context, requestedVersion int64) (appliedVersion int64, err error)
 
 var (
-	presenceReadTimeout  = 75 * time.Second
-	presenceWriteTimeout = 5 * time.Second
+	presenceReadTimeout              = 75 * time.Second
+	presenceWriteTimeout             = 5 * time.Second
+	presenceReadLimit                = int64(64 << 10)
+	presenceInitialReconnectBackoff  = time.Second
+	presenceMaxReconnectBackoff      = 30 * time.Second
+	presenceStableConnectionDuration = presenceReadTimeout
 )
 
 func (c *Client) RunPresence(ctx context.Context, handleConfig PresenceConfigHandler) {
-	backoff := time.Second
+	c.runPresenceLoop(ctx, handleConfig, presenceLoopOptions{
+		runOnce: c.runPresenceOnce,
+		now:     time.Now,
+		sleep:   sleepContext,
+		jitter:  randomPresenceJitter,
+	})
+}
+
+type presenceLoopOptions struct {
+	runOnce                  func(context.Context, PresenceConfigHandler) error
+	now                      func() time.Time
+	sleep                    func(context.Context, time.Duration) bool
+	jitter                   func(time.Duration) time.Duration
+	initialBackoff           time.Duration
+	maxBackoff               time.Duration
+	stableConnectionDuration time.Duration
+}
+
+func (c *Client) runPresenceLoop(ctx context.Context, handleConfig PresenceConfigHandler, options presenceLoopOptions) {
+	if options.runOnce == nil {
+		options.runOnce = c.runPresenceOnce
+	}
+	if options.now == nil {
+		options.now = time.Now
+	}
+	if options.sleep == nil {
+		options.sleep = sleepContext
+	}
+	if options.jitter == nil {
+		options.jitter = randomPresenceJitter
+	}
+	if options.initialBackoff <= 0 {
+		options.initialBackoff = presenceInitialReconnectBackoff
+	}
+	if options.maxBackoff <= 0 {
+		options.maxBackoff = presenceMaxReconnectBackoff
+	}
+	if options.maxBackoff < options.initialBackoff {
+		options.maxBackoff = options.initialBackoff
+	}
+	if options.stableConnectionDuration <= 0 {
+		options.stableConnectionDuration = presenceStableConnectionDuration
+	}
+
+	backoff := options.initialBackoff
 	for ctx.Err() == nil {
-		err := c.runPresenceOnce(ctx, handleConfig)
+		started := options.now()
+		err := options.runOnce(ctx, handleConfig)
+		connectedFor := options.now().Sub(started)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
 			log.Printf("presence websocket disconnected: %v", err)
 		}
-		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
-		wait := backoff + jitter
-		if wait > 30*time.Second {
-			wait = 30 * time.Second
+		if connectedFor >= options.stableConnectionDuration {
+			backoff = options.initialBackoff
 		}
-		select {
-		case <-ctx.Done():
+		wait := backoff + options.jitter(backoff)
+		if wait > options.maxBackoff {
+			wait = options.maxBackoff
+		}
+		if !options.sleep(ctx, wait) {
 			return
-		case <-time.After(wait):
 		}
-		if backoff < 30*time.Second {
+		if backoff < options.maxBackoff {
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if backoff > options.maxBackoff {
+				backoff = options.maxBackoff
 			}
 		}
 	}
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func randomPresenceJitter(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(backoff / 2)))
 }
 
 func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfigHandler) error {
@@ -69,6 +137,7 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 		return err
 	}
 	defer conn.Close()
+	conn.SetReadLimit(presenceReadLimit)
 	log.Printf("presence websocket connected")
 	refreshReadDeadline := func() error {
 		return conn.SetReadDeadline(time.Now().Add(presenceReadTimeout))
@@ -125,7 +194,7 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 				continue
 			}
 			if appliedVersion == 0 {
-				appliedVersion = message.Version
+				continue
 			}
 			payload, _ := json.Marshal(PresenceClientMessage{Type: "config_applied", Version: appliedVersion})
 			if err := writeMessage(websocket.TextMessage, payload); err != nil {

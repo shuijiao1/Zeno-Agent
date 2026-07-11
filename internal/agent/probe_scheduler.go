@@ -39,9 +39,6 @@ func (s *ProbeScheduler) MarkCompleted(targets []ProbeTarget, now time.Time) {
 }
 
 func targetIntervalElapsed(target ProbeTarget, last time.Time, now time.Time) bool {
-	interval := time.Duration(target.IntervalSec) * time.Second
-	if interval <= 0 {
-		return true
-	}
+	interval := time.Duration(normalizedProbeIntervalSec(target.IntervalSec)) * time.Second
 	return !now.Before(last.Add(interval))
 }

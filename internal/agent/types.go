@@ -65,17 +65,21 @@ type ProbeTarget struct {
 }
 
 type ProbeResultsRequest struct {
-	Rounds []probeRoundPayload `json:"rounds"`
+	ConfigVersion int64               `json:"config_version,omitempty"`
+	Rounds        []probeRoundPayload `json:"rounds"`
 }
 
 type ProbeRound struct {
-	TargetID string
-	TS       time.Time
-	Type     string
-	Samples  []ProbeSample
+	RoundID       string
+	ConfigVersion int64
+	TargetID      string
+	TS            time.Time
+	Type          string
+	Samples       []ProbeSample
 }
 
 type probeRoundPayload struct {
+	RoundID  string        `json:"round_id,omitempty"`
 	TargetID string        `json:"target_id"`
 	TS       int64         `json:"ts"`
 	Type     string        `json:"type"`

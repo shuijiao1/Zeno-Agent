@@ -15,6 +15,7 @@ HOST_INTERVAL="${ZENO_AGENT_HOST_INTERVAL:-30m}"
 IDENTITY_REFRESH_INTERVAL="${ZENO_AGENT_IDENTITY_REFRESH_INTERVAL:-12h}"
 NETWORK_INTERFACES="${ZENO_AGENT_NETWORK_INTERFACES:-}"
 DISK_MOUNTS="${ZENO_AGENT_DISK_MOUNTS:-}"
+SERVICE_NAME="zeno-agent"
 
 fail() {
   echo "错误: $*" >&2
@@ -25,102 +26,356 @@ need() {
   command -v "$1" >/dev/null 2>&1 || fail "未找到 $1，请先安装后重试"
 }
 
-[ -n "$CONTROLLER_URL" ] || fail "必须设置 ZENO_CONTROLLER_URL"
-[ -n "$NODE_ID" ] || fail "必须设置 ZENO_NODE_ID"
-[ -n "$TOKEN" ] || [ -s "$TOKEN_FILE" ] || fail "必须设置 ZENO_AGENT_TOKEN 或提供已有 token 文件"
+download_stdout() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 --retry-delay 2 "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --tries=3 "$url"
+  else
+    fail "未找到 curl 或 wget"
+  fi
+}
 
-need uname
-need sed
-need tar
-need mktemp
+download_file() {
+  local url="$1"
+  local dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --retry-delay 2 "$url" -o "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --tries=3 -O "$dest" "$url"
+  else
+    fail "未找到 curl 或 wget"
+  fi
+}
 
-if command -v curl >/dev/null 2>&1; then
-  DL='curl -fsSL'
-elif command -v wget >/dev/null 2>&1; then
-  DL='wget -qO-'
-else
-  fail "未找到 curl 或 wget"
-fi
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print tolower($1)}'
+  else
+    fail "未找到 sha256sum 或 shasum，无法校验下载完整性"
+  fi
+}
 
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-case "$OS" in
-  linux) GOOS=linux ;;
-  darwin) GOOS=darwin ;;
-  *) fail "暂不支持系统: $OS" ;;
-esac
-case "$ARCH" in
-  x86_64|amd64) GOARCH=amd64 ;;
-  aarch64|arm64) GOARCH=arm64 ;;
-  armv7l|armv6l) GOARCH=arm ;;
-  *) fail "暂不支持架构: $ARCH" ;;
-esac
+verify_asset_checksum() {
+  local asset="$1"
+  local archive="$2"
+  local sums_file="$3"
+  local expected
+  expected=$(awk -v f="$asset" '$2 == f { print tolower($1); found=1; exit } END { if (!found) exit 1 }' "$sums_file") || \
+    fail "SHA256SUMS 中未找到 $asset 的校验值"
+  local actual
+  actual=$(sha256_file "$archive")
+  [ "$actual" = "$expected" ] || fail "下载完整性校验失败: $asset"
+}
 
-if [ "$VERSION" = "latest" ]; then
-  VERSION=$($DL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
-  [ -n "$VERSION" ] || fail "无法获取最新版本"
-fi
-
-ASSET="zeno-agent_${GOOS}_${GOARCH}.tar.gz"
-URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
-TMP=$(mktemp -d)
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
-
-echo "下载 Zeno Agent $VERSION ($GOOS/$GOARCH)..."
-if command -v curl >/dev/null 2>&1; then
-  curl -fL "$URL" -o "$TMP/$ASSET"
-else
-  wget -O "$TMP/$ASSET" "$URL"
-fi
-
-tar -xzf "$TMP/$ASSET" -C "$TMP"
-FOUND=$(find "$TMP" -type f -name 'zeno-agent' | head -n1)
-[ -n "$FOUND" ] || fail "压缩包内未找到 zeno-agent"
-
-if [ -z "$INSTALL_DIR" ]; then
-  case "$GOOS" in
-    darwin) INSTALL_DIR="/Library/Application Support/Zeno Agent" ;;
-    *) INSTALL_DIR="/opt/zeno-agent" ;;
+reject_systemd_arg() {
+  case "$1" in
+    *$'\n'*|*$'\r'*) fail "systemd 参数包含非法换行" ;;
   esac
-fi
-if [ -z "$BIN" ]; then
-  BIN="/usr/local/bin/zeno-agent"
-fi
-if [ -z "$TOKEN_FILE" ]; then
+}
+
+systemd_escape_arg() {
+  local value="$1"
+  reject_systemd_arg "$value"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//%/%%}
+  value=${value//\$/\$\$}
+  printf '"%s"' "$value"
+}
+
+systemd_join_args() {
+  local first=1
+  local arg
+  for arg in "$@"; do
+    if [ "$first" -eq 0 ]; then
+      printf ' '
+    fi
+    first=0
+    systemd_escape_arg "$arg"
+  done
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+atomic_install_binary() {
+  local source="$1"
+  local dest="$2"
+  local backup_var="$3"
+  local dest_dir
+  dest_dir=$(dirname "$dest")
+  local dest_base
+  dest_base=$(basename "$dest")
+  local new_bin="$dest_dir/.${dest_base}.new.$$"
+  local backup=""
+  install -m 755 "$source" "$new_bin"
+  if [ -e "$dest" ]; then
+    backup="$dest.bak-$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$dest" "$backup"
+  fi
+  mv -f "$new_bin" "$dest"
+  printf -v "$backup_var" '%s' "$backup"
+}
+
+restore_binary_backup() {
+  local backup="$1"
+  local dest="$2"
+  if [ -z "$backup" ] || [ ! -f "$backup" ]; then
+    echo "旧二进制备份不存在，无法恢复: $backup" >&2
+    return 1
+  fi
+  local dest_dir
+  dest_dir=$(dirname "$dest")
+  local dest_base
+  dest_base=$(basename "$dest")
+  local restore_tmp="$dest_dir/.${dest_base}.restore.$$"
+  rm -f "$restore_tmp"
+  if ! cp -p "$backup" "$restore_tmp"; then
+    rm -f "$restore_tmp"
+    echo "复制旧二进制备份失败，备份仍保留: $backup" >&2
+    return 1
+  fi
+  if ! mv -f "$restore_tmp" "$dest"; then
+    rm -f "$restore_tmp"
+    echo "原子恢复旧二进制失败，备份仍保留: $backup" >&2
+    return 1
+  fi
+  if [ "$(sha256_file "$backup")" != "$(sha256_file "$dest")" ]; then
+    echo "旧二进制恢复校验失败，备份仍保留: $backup" >&2
+    return 1
+  fi
+}
+
+stop_linux_service_for_restore() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    if ! systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  echo "服务 $SERVICE_NAME 停止超时，拒绝覆盖旧二进制" >&2
+  return 1
+}
+
+restore_file_backup_atomic() {
+  local backup="$1"
+  local dest="$2"
+  local label="$3"
+  if [ -z "$backup" ] || [ ! -f "$backup" ]; then
+    echo "$label 备份不存在，无法恢复: $backup" >&2
+    return 1
+  fi
+  local dest_dir
+  dest_dir=$(dirname "$dest")
+  local dest_base
+  dest_base=$(basename "$dest")
+  local restore_tmp="$dest_dir/.${dest_base}.restore.$$"
+  rm -f "$restore_tmp"
+  if ! cp -p "$backup" "$restore_tmp"; then
+    rm -f "$restore_tmp"
+    echo "$label 备份复制失败，备份仍保留: $backup" >&2
+    return 1
+  fi
+  if ! mv -f "$restore_tmp" "$dest"; then
+    rm -f "$restore_tmp"
+    echo "$label 原子恢复失败，备份仍保留: $backup" >&2
+    return 1
+  fi
+}
+
+reject_symlink_path() {
+  local path="$1"
+  local label="$2"
+  if [ -L "$path" ]; then
+    fail "$label 不能是符号链接: $path"
+  fi
+}
+
+token_owner_group() {
   case "$GOOS" in
-    darwin) TOKEN_FILE="/Library/Application Support/Zeno/agent-token" ;;
-    *) TOKEN_FILE="/etc/zeno/agent-token" ;;
+    darwin) printf 'root:wheel' ;;
+    linux) printf 'root:root' ;;
+    *) fail "暂不支持系统: $GOOS" ;;
   esac
-fi
+}
 
-extra_args=()
-if [ -n "$NETWORK_INTERFACES" ]; then
-  extra_args+=("-network-interfaces" "$NETWORK_INTERFACES")
-fi
-if [ -n "$DISK_MOUNTS" ]; then
-  extra_args+=("-disk-mounts" "$DISK_MOUNTS")
-fi
+token_expected_owner_mode() {
+  case "$GOOS" in
+    darwin) printf '0:0:600' ;;
+    linux) printf '0:0:600' ;;
+    *) fail "暂不支持系统: $GOOS" ;;
+  esac
+}
 
-install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
-install -m 755 "$FOUND" "$BIN"
-if [ -n "$TOKEN" ]; then
-  umask 077
-  printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
-fi
-chmod 600 "$TOKEN_FILE"
+file_owner_mode() {
+  local path="$1"
+  case "$GOOS" in
+    darwin) stat -f '%u:%g:%Lp' "$path" ;;
+    linux) stat -c '%u:%g:%a' "$path" ;;
+    *) fail "暂不支持系统: $GOOS" ;;
+  esac
+}
 
-if [ "$GOOS" = "darwin" ]; then
-  PLIST="/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist"
-  xml_escape() {
-    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
-  }
-  plist_extra_args=""
+assert_token_file_secure() {
+  reject_symlink_path "$TOKEN_FILE" "token 文件"
+  local actual
+  actual=$(file_owner_mode "$TOKEN_FILE")
+  local expected
+  expected=$(token_expected_owner_mode)
+  [ "$actual" = "$expected" ] || fail "token 文件 owner/mode 不安全: $actual，期望 $expected ($(token_owner_group))"
+}
+
+set_token_owner_mode() {
+  local path="$1"
+  reject_symlink_path "$path" "token 文件"
+  chown "$(token_owner_group)" "$path"
+  chmod 600 "$path"
+}
+
+restore_token_backup() {
+  restore_file_backup_atomic "$backup_token" "$TOKEN_FILE" "token 文件" || return 1
+  set_token_owner_mode "$TOKEN_FILE" || return 1
+  assert_token_file_secure
+}
+
+write_token_file() {
+  reject_symlink_path "$TOKEN_FILE" "token 文件"
+  if [ -n "$TOKEN" ]; then
+    local token_dir
+    token_dir=$(dirname "$TOKEN_FILE")
+    local tmp_token="$token_dir/.agent-token.tmp.$$"
+    rm -f "$tmp_token"
+    umask 077
+    if ! printf '%s\n' "$TOKEN" > "$tmp_token"; then
+      rm -f "$tmp_token"
+      fail "写入临时 token 文件失败"
+    fi
+    set_token_owner_mode "$tmp_token"
+    mv -f "$tmp_token" "$TOKEN_FILE"
+  else
+    [ -f "$TOKEN_FILE" ] || fail "已有 token 路径不是普通文件: $TOKEN_FILE"
+  fi
+  set_token_owner_mode "$TOKEN_FILE"
+  assert_token_file_secure
+}
+
+install_linux_service() {
+  local backup_bin="$1"
+  local exec_start
+  exec_start=$(systemd_join_args \
+    "$BIN" \
+    -controller-url "$CONTROLLER_URL" \
+    -node-id "$NODE_ID" \
+    -token-file "$TOKEN_FILE" \
+    -state-interval "$STATE_INTERVAL" \
+    -heartbeat-interval "$HEARTBEAT_INTERVAL" \
+    -host-interval "$HOST_INTERVAL" \
+    -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL" \
+    -version "$VERSION" \
+    "${extra_args[@]}")
+
+  local unit="/etc/systemd/system/${SERVICE_NAME}.service"
+  local unit_tmp="${unit}.tmp.$$"
+  local unit_backup=""
+  service_kind="linux"
+  service_config="$unit"
+  if systemctl is-enabled --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+    service_was_enabled=1
+  else
+    service_was_enabled=0
+  fi
+  if systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+    service_was_active=1
+  else
+    service_was_active=0
+  fi
+  if [ -f "$unit" ]; then
+    service_config_existed=1
+    unit_backup="$unit.bak-$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$unit" "$unit_backup"
+    service_config_backup="$unit_backup"
+  fi
+
+  cat > "$unit_tmp" <<EOF_SERVICE
+[Unit]
+Description=Zeno Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$exec_start
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+  mv -f "$unit_tmp" "$unit"
+  chown root:root "$unit"
+  chmod 644 "$unit"
+
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME.service" >/dev/null
+  if ! systemctl restart "$SERVICE_NAME.service" || ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
+    fail "Zeno Agent 启动失败，准备回滚到旧二进制"
+  fi
+}
+
+install_macos_service() {
+  local backup_bin="$1"
+  local plist="/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist"
+  local plist_tmp="${plist}.tmp.$$"
+  local plist_backup=""
+  service_kind="darwin"
+  service_config="$plist"
+  if launchctl print-disabled system 2>/dev/null | grep -Eq '"li\.shuijiao\.zeno-agent"[[:space:]]*=>[[:space:]]*true'; then
+    service_was_enabled=0
+  else
+    service_was_enabled=1
+  fi
+  if launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+    service_was_active=1
+  else
+    service_was_active=0
+  fi
+  if [ -f "$plist" ]; then
+    service_config_existed=1
+    plist_backup="$plist.bak-$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$plist" "$plist_backup"
+    service_config_backup="$plist_backup"
+  fi
+
+  local plist_extra_args=""
+  local arg
   for arg in "${extra_args[@]}"; do
     plist_extra_args="${plist_extra_args}    <string>$(xml_escape "$arg")</string>
 "
   done
-  cat > "$PLIST" <<EOF_PLIST
+
+  cat > "$plist_tmp" <<EOF_PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -146,37 +401,250 @@ ${plist_extra_args}
 </dict>
 </plist>
 EOF_PLIST
-  chown root:wheel "$PLIST" 2>/dev/null || true
-  chmod 644 "$PLIST"
-  launchctl bootout system "$PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap system "$PLIST"
+  mv -f "$plist_tmp" "$plist"
+  chown root:wheel "$plist"
+  chmod 644 "$plist"
+  launchctl bootout system "$plist" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap system "$plist"; then
+    if [ -n "$backup_bin" ]; then
+      restore_binary_backup "$backup_bin" "$BIN" || fail "Zeno Agent 启动失败，旧二进制回滚失败；备份仍保留: $backup_bin"
+    else
+      rm -f "$BIN" 2>/dev/null || true
+    fi
+    if [ -n "$plist_backup" ] && [ -f "$plist_backup" ]; then
+      restore_file_backup_atomic "$plist_backup" "$plist" "LaunchDaemon 配置" || fail "Zeno Agent 启动失败，LaunchDaemon 配置回滚失败；备份仍保留: $plist_backup"
+      chown root:wheel "$plist"
+      chmod 644 "$plist"
+      launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
+    fi
+    fail "Zeno Agent 启动失败，已尝试回滚到旧二进制"
+  fi
   launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
   launchctl kickstart -k system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
-else
-  systemd_extra_args=""
-  if [ "${#extra_args[@]}" -gt 0 ]; then
-    printf -v systemd_extra_args ' %q' "${extra_args[@]}"
+  if ! launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+    if [ -n "$backup_bin" ]; then
+      restore_binary_backup "$backup_bin" "$BIN" || fail "Zeno Agent 启动状态验证失败，旧二进制回滚失败；备份仍保留: $backup_bin"
+    else
+      rm -f "$BIN" 2>/dev/null || true
+    fi
+    if [ -n "$plist_backup" ] && [ -f "$plist_backup" ]; then
+      restore_file_backup_atomic "$plist_backup" "$plist" "LaunchDaemon 配置" || fail "Zeno Agent 启动状态验证失败，LaunchDaemon 配置回滚失败；备份仍保留: $plist_backup"
+      chown root:wheel "$plist"
+      chmod 644 "$plist"
+    fi
+    fail "Zeno Agent 启动状态验证失败，已尝试回滚到旧二进制"
   fi
-  cat > /etc/systemd/system/zeno-agent.service <<EOF_SERVICE
-[Unit]
-Description=Zeno Agent
-After=network-online.target
-Wants=network-online.target
+}
 
-[Service]
-Type=simple
-ExecStart=$BIN -controller-url $CONTROLLER_URL -node-id $NODE_ID -token-file $TOKEN_FILE -state-interval $STATE_INTERVAL -heartbeat-interval $HEARTBEAT_INTERVAL -host-interval $HOST_INTERVAL -identity-refresh-interval $IDENTITY_REFRESH_INTERVAL -version $VERSION${systemd_extra_args}
-Restart=always
-RestartSec=5s
+[ -n "$CONTROLLER_URL" ] || fail "必须设置 ZENO_CONTROLLER_URL"
+[ -n "$NODE_ID" ] || fail "必须设置 ZENO_NODE_ID"
 
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
+need uname
+need sed
+need tar
+need mktemp
+need awk
+need date
+need find
+need grep
+need stat
 
-  systemctl daemon-reload
-  systemctl enable --now zeno-agent.service >/dev/null
-  systemctl restart zeno-agent.service
-  systemctl is-active --quiet zeno-agent.service
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+case "$OS" in
+  linux) GOOS=linux ;;
+  darwin) GOOS=darwin ;;
+  *) fail "暂不支持系统: $OS" ;;
+esac
+case "$ARCH" in
+  x86_64|amd64) GOARCH=amd64 ;;
+  aarch64|arm64) GOARCH=arm64 ;;
+  armv7l|armv6l) GOARCH=arm ;;
+  *) fail "暂不支持架构: $ARCH" ;;
+esac
+
+if [ "$VERSION" = "latest" ]; then
+  VERSION=$(download_stdout "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+  [ -n "$VERSION" ] || fail "无法获取最新版本"
 fi
 
+ASSET="zeno-agent_${GOOS}_${GOARCH}.tar.gz"
+URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+SUMS_URL="https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS"
+TMP=$(mktemp -d)
+install_started=0
+install_committed=0
+had_existing_binary=0
+had_existing_token=0
+backup_bin=""
+backup_token=""
+service_kind=""
+service_config=""
+service_config_backup=""
+service_config_existed=0
+service_was_enabled=0
+service_was_active=0
+
+cleanup() {
+  local status=$?
+  local cleanup_status=$status
+  local can_restore_binary=1
+  if [ "$status" -ne 0 ] && [ "$install_started" -eq 1 ] && [ "$install_committed" -eq 0 ]; then
+    if [ "$service_kind" = "linux" ]; then
+      if ! stop_linux_service_for_restore; then
+        cleanup_status=1
+        can_restore_binary=0
+      fi
+    fi
+    if [ "$had_existing_binary" -eq 1 ]; then
+      if [ -n "$backup_bin" ]; then
+        if [ "$can_restore_binary" -eq 0 ]; then
+          echo "服务未确认停止，未覆盖恢复旧二进制；备份仍保留: $backup_bin" >&2
+        elif ! restore_binary_backup "$backup_bin" "$BIN"; then
+          echo "旧二进制恢复失败，备份仍保留: $backup_bin" >&2
+          cleanup_status=1
+        fi
+      fi
+    else
+      rm -f "$BIN" 2>/dev/null || true
+    fi
+    if [ "$had_existing_token" -eq 1 ]; then
+      if ! restore_token_backup; then
+        echo "token 文件恢复失败，备份仍保留: $backup_token" >&2
+        cleanup_status=1
+      fi
+    else
+      if ! rm -f "$TOKEN_FILE" 2>/dev/null; then
+        echo "移除新 token 文件失败: $TOKEN_FILE" >&2
+        cleanup_status=1
+      fi
+    fi
+    if [ -n "$service_config" ]; then
+      if [ "$service_config_existed" -eq 1 ]; then
+        if ! restore_file_backup_atomic "$service_config_backup" "$service_config" "服务配置"; then
+          echo "服务配置恢复失败: $service_config_backup -> $service_config" >&2
+          cleanup_status=1
+        else
+          if [ "$service_kind" = "linux" ]; then
+            chown root:root "$service_config" || cleanup_status=1
+            chmod 644 "$service_config" || cleanup_status=1
+          elif [ "$service_kind" = "darwin" ]; then
+            chown root:wheel "$service_config" || cleanup_status=1
+            chmod 644 "$service_config" || cleanup_status=1
+          fi
+        fi
+      else
+        if ! rm -f "$service_config" 2>/dev/null; then
+          echo "移除新服务配置失败: $service_config" >&2
+          cleanup_status=1
+        fi
+      fi
+      if [ "$service_kind" = "linux" ]; then
+        if ! systemctl daemon-reload >/dev/null 2>&1; then
+          echo "systemd daemon-reload 失败" >&2
+          cleanup_status=1
+        fi
+        if systemctl list-unit-files "$SERVICE_NAME.service" >/dev/null 2>&1 || [ "$service_was_enabled" -eq 1 ] || [ "$service_was_active" -eq 1 ]; then
+          if [ "$service_was_enabled" -eq 1 ]; then
+            if ! systemctl enable "$SERVICE_NAME.service" >/dev/null 2>&1; then
+              echo "恢复 systemd enabled 状态失败" >&2
+              cleanup_status=1
+            fi
+          else
+            if ! systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1; then
+              echo "恢复 systemd disabled 状态失败" >&2
+              cleanup_status=1
+            fi
+          fi
+          if [ "$service_was_active" -eq 1 ]; then
+            if ! systemctl restart "$SERVICE_NAME.service" >/dev/null 2>&1; then
+              echo "恢复 systemd active 状态失败" >&2
+              cleanup_status=1
+            fi
+          else
+            systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+          fi
+        fi
+      elif [ "$service_kind" = "darwin" ]; then
+        launchctl bootout system "$service_config" >/dev/null 2>&1 || true
+        if [ "$service_was_enabled" -eq 1 ]; then
+          launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+        else
+          launchctl disable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+        fi
+        if [ "$service_was_active" -eq 1 ]; then
+          launchctl bootstrap system "$service_config" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  fi
+  if [ "$status" -eq 0 ] && [ -n "$backup_token" ]; then
+    rm -f "$backup_token" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+  return "$cleanup_status"
+}
+trap cleanup EXIT
+
+echo "下载 Zeno Agent $VERSION ($GOOS/$GOARCH)..."
+download_file "$URL" "$TMP/$ASSET"
+download_file "$SUMS_URL" "$TMP/SHA256SUMS"
+verify_asset_checksum "$ASSET" "$TMP/$ASSET" "$TMP/SHA256SUMS"
+
+tar -xzf "$TMP/$ASSET" -C "$TMP"
+FOUND=$(find "$TMP" -type f -name 'zeno-agent' | head -n1)
+[ -n "$FOUND" ] || fail "压缩包内未找到 zeno-agent"
+
+if [ -z "$INSTALL_DIR" ]; then
+  case "$GOOS" in
+    darwin) INSTALL_DIR="/Library/Application Support/Zeno Agent" ;;
+    *) INSTALL_DIR="/opt/zeno-agent" ;;
+  esac
+fi
+if [ -z "$BIN" ]; then
+  BIN="/usr/local/bin/zeno-agent"
+fi
+if [ -z "$TOKEN_FILE" ]; then
+  case "$GOOS" in
+    darwin) TOKEN_FILE="/Library/Application Support/Zeno/agent-token" ;;
+    *) TOKEN_FILE="/etc/zeno/agent-token" ;;
+  esac
+fi
+reject_symlink_path "$TOKEN_FILE" "token 文件"
+[ -n "$TOKEN" ] || [ -s "$TOKEN_FILE" ] || fail "必须设置 ZENO_AGENT_TOKEN 或提供已有 token 文件"
+
+extra_args=()
+if [ -n "$NETWORK_INTERFACES" ]; then
+  extra_args+=("-network-interfaces" "$NETWORK_INTERFACES")
+fi
+if [ -n "$DISK_MOUNTS" ]; then
+  extra_args+=("-disk-mounts" "$DISK_MOUNTS")
+fi
+
+install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
+if [ -e "$BIN" ]; then
+  had_existing_binary=1
+fi
+if [ -e "$TOKEN_FILE" ]; then
+  reject_symlink_path "$TOKEN_FILE" "token 文件"
+  [ -f "$TOKEN_FILE" ] || fail "已有 token 路径不是普通文件: $TOKEN_FILE"
+  had_existing_token=1
+  backup_token=$(mktemp "$(dirname "$TOKEN_FILE")/.agent-token.backup.XXXXXXXXXX")
+  cp -p "$TOKEN_FILE" "$backup_token"
+  set_token_owner_mode "$backup_token"
+fi
+install_started=1
+write_token_file
+atomic_install_binary "$FOUND" "$BIN" backup_bin
+
+if [ "$GOOS" = "darwin" ]; then
+  install_macos_service "$backup_bin"
+else
+  install_linux_service "$backup_bin"
+fi
+install_committed=1
+
+if [ -n "$backup_bin" ]; then
+  echo "已保留旧二进制: $backup_bin"
+fi
 echo "Zeno Agent 已安装并启动: node=$NODE_ID version=$VERSION"

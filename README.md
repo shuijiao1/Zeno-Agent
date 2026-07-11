@@ -17,14 +17,17 @@ Controller 本体仓库：<https://github.com/shuijiao1/Zeno>
 Linux / macOS：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shuijiao1/Zeno-Agent/main/install.sh | sudo env \
+set -o pipefail
+curl -fsSL https://zeno.shuijiao.de/agent/install.sh | sudo env \
   ZENO_CONTROLLER_URL=https://zeno.example.com \
   ZENO_NODE_ID=<node-id> \
   ZENO_AGENT_TOKEN=<agent-token> \
   bash
 ```
 
-Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会下载 `install.ps1`，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
+Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会从 `https://zeno.shuijiao.de/agent/install.ps1` 下载安装脚本，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
+
+安装器会下载 Release 中的 `SHA256SUMS` 并校验 Agent 压缩包；下载失败或校验不一致时会安全停止，不会替换当前可用版本。
 
 变量说明：
 

@@ -19,6 +19,8 @@ type Client struct {
 	http    *http.Client
 }
 
+const maxAgentAPIJSONBodyBytes int64 = 1 << 20
+
 func NewClient(baseURL, nodeID, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -53,13 +55,19 @@ func (c *Client) FetchProbeConfig(ctx context.Context) (ProbeTargetsResponse, er
 	if err := c.doJSON(ctx, http.MethodGet, "/api/agent/v1/probe-targets", nil, &response); err != nil {
 		return ProbeTargetsResponse{}, err
 	}
+	response.Targets = SanitizeProbeTargets(response.Targets)
 	return response, nil
 }
 
 func (c *Client) PostProbeResults(ctx context.Context, rounds []ProbeRound) error {
-	payload := ProbeResultsRequest{Rounds: make([]probeRoundPayload, 0, len(rounds))}
+	configVersion, err := commonProbeConfigVersion(rounds)
+	if err != nil {
+		return err
+	}
+	payload := ProbeResultsRequest{ConfigVersion: configVersion, Rounds: make([]probeRoundPayload, 0, len(rounds))}
 	for _, round := range rounds {
 		payload.Rounds = append(payload.Rounds, probeRoundPayload{
+			RoundID:  round.RoundID,
 			TargetID: round.TargetID,
 			TS:       round.TS.UTC().Unix(),
 			Type:     round.Type,
@@ -67,6 +75,25 @@ func (c *Client) PostProbeResults(ctx context.Context, rounds []ProbeRound) erro
 		})
 	}
 	return c.doJSON(ctx, http.MethodPost, "/api/agent/v1/probe-results", payload, nil)
+}
+
+func commonProbeConfigVersion(rounds []ProbeRound) (int64, error) {
+	if len(rounds) == 0 {
+		return 0, nil
+	}
+	version := rounds[0].ConfigVersion
+	if version < 0 {
+		return 0, fmt.Errorf("invalid probe config version %d", version)
+	}
+	for _, round := range rounds[1:] {
+		if round.ConfigVersion < 0 {
+			return 0, fmt.Errorf("invalid probe config version %d", round.ConfigVersion)
+		}
+		if version != round.ConfigVersion {
+			return 0, fmt.Errorf("mixed probe config versions %d and %d", version, round.ConfigVersion)
+		}
+	}
+	return version, nil
 }
 
 func (c *Client) PresenceWebSocketURL() (string, error) {
@@ -120,12 +147,22 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestValue a
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("agent api %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(message)))
+		// The Controller response is not trusted diagnostic text: it may be very
+		// large or contain a proxy error page with credentials. Drain only a small
+		// bounded prefix for connection reuse and report status/path without body.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("agent api %s %s returned %d", method, path, resp.StatusCode)
 	}
 	if responseValue == nil {
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(responseValue)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAgentAPIJSONBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(responseBody)) > maxAgentAPIJSONBodyBytes {
+		return fmt.Errorf("agent api %s %s response exceeds %d bytes", method, path, maxAgentAPIJSONBodyBytes)
+	}
+	return json.Unmarshal(responseBody, responseValue)
 }

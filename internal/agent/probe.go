@@ -3,6 +3,9 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,16 +17,87 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const drawableLatencyCap = 5 * time.Second
+var probeRoundSequence atomic.Uint64
+
+const (
+	drawableLatencyCap = 5 * time.Second
+
+	maxProbeTargets           = 32
+	maxProbeCount             = 32
+	defaultProbeTimeoutMS     = 1000
+	minProbeTimeoutMS         = 100
+	maxProbeTimeoutMS         = 5000
+	defaultProbeIntervalSec   = 60
+	minProbeIntervalSec       = 5
+	maxProbeIntervalSec       = 60 * 60
+	maxConcurrentProbeTargets = 16
+	maxProbeSamplesPerRun     = 1024
+	maxProbeTargetBudgetMS    = 60_000
+	maxProbeNodeBudgetMS      = 120_000
+)
+
+// SanitizeProbeTargets enforces the Agent-side copy of the Controller probe
+// budget before targets can drive goroutines, process execution, or outbound
+// requests. The Controller should already validate these bounds; the Agent keeps
+// this guard so a stale/malicious controller response cannot exhaust resources.
+func SanitizeProbeTargets(targets []ProbeTarget) []ProbeTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	if len(targets) > maxProbeTargets {
+		targets = targets[:maxProbeTargets]
+	}
+	sanitized := make([]ProbeTarget, 0, len(targets))
+	for _, target := range targets {
+		target.Count = normalizedProbeCount(target.Count)
+		target.TimeoutMS = normalizedProbeTimeoutMS(target.TimeoutMS)
+		target.IntervalSec = normalizedProbeIntervalSec(target.IntervalSec)
+		if maxCount := maxProbeTargetBudgetMS / target.TimeoutMS; target.Count > maxCount {
+			target.Count = maxCount
+		}
+		sanitized = append(sanitized, target)
+	}
+	return sanitized
+}
+
+// LimitProbeTargetsForRun applies the per-run sample and worst-case execution
+// budgets. It is kept separate from SanitizeProbeTargets so a large valid config
+// can be spread across intervals instead of creating an oversized result body or
+// an excessively long probe round.
+func LimitProbeTargetsForRun(targets []ProbeTarget) []ProbeTarget {
+	sanitized := SanitizeProbeTargets(targets)
+	if len(sanitized) == 0 {
+		return nil
+	}
+	limited := make([]ProbeTarget, 0, len(sanitized))
+	remainingSamples := maxProbeSamplesPerRun
+	remainingBudgetMS := maxProbeNodeBudgetMS
+	for _, target := range sanitized {
+		if remainingSamples <= 0 || remainingBudgetMS < target.TimeoutMS {
+			break
+		}
+		if target.Count > remainingSamples {
+			target.Count = remainingSamples
+		}
+		if maxCount := remainingBudgetMS / target.TimeoutMS; target.Count > maxCount {
+			target.Count = maxCount
+		}
+		if target.Count <= 0 {
+			continue
+		}
+		limited = append(limited, target)
+		remainingSamples -= target.Count
+		remainingBudgetMS -= target.Count * target.TimeoutMS
+	}
+	return limited
+}
 
 func RunTCPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
-	count := target.Count
-	if count <= 0 {
-		count = 1
-	}
+	count := normalizedProbeCount(target.Count)
 	timeout := normalizedProbeTimeout(target.TimeoutMS)
 	observationTimeout := latencyObservationTimeout(timeout)
 	if target.Port == nil {
@@ -59,10 +133,7 @@ func RunTCPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 var pingLatencyPattern = regexp.MustCompile(`time[=<]([0-9.]+)\s*ms`)
 
 func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
-	count := target.Count
-	if count <= 0 {
-		count = 1
-	}
+	count := normalizedProbeCount(target.Count)
 	timeout := normalizedProbeTimeout(target.TimeoutMS)
 	observationTimeout := latencyObservationTimeout(timeout)
 	address := strings.TrimSpace(target.Address)
@@ -102,10 +173,7 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 }
 
 func RunHTTPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
-	count := target.Count
-	if count <= 0 {
-		count = 1
-	}
+	count := normalizedProbeCount(target.Count)
 	timeout := normalizedProbeTimeout(target.TimeoutMS)
 	observationTimeout := latencyObservationTimeout(timeout)
 	address := strings.TrimSpace(target.Address)
@@ -154,11 +222,43 @@ func RunHTTPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 }
 
 func normalizedProbeTimeout(timeoutMS int) time.Duration {
-	timeout := time.Duration(timeoutMS) * time.Millisecond
-	if timeout <= 0 {
-		return time.Second
+	return time.Duration(normalizedProbeTimeoutMS(timeoutMS)) * time.Millisecond
+}
+
+func normalizedProbeCount(count int) int {
+	if count <= 0 {
+		return 1
 	}
-	return timeout
+	if count > maxProbeCount {
+		return maxProbeCount
+	}
+	return count
+}
+
+func normalizedProbeTimeoutMS(timeoutMS int) int {
+	if timeoutMS <= 0 {
+		return defaultProbeTimeoutMS
+	}
+	if timeoutMS < minProbeTimeoutMS {
+		return minProbeTimeoutMS
+	}
+	if timeoutMS > maxProbeTimeoutMS {
+		return maxProbeTimeoutMS
+	}
+	return timeoutMS
+}
+
+func normalizedProbeIntervalSec(intervalSec int) int {
+	if intervalSec <= 0 {
+		return defaultProbeIntervalSec
+	}
+	if intervalSec < minProbeIntervalSec {
+		return minProbeIntervalSec
+	}
+	if intervalSec > maxProbeIntervalSec {
+		return maxProbeIntervalSec
+	}
+	return intervalSec
 }
 
 func latencyObservationTimeout(timeout time.Duration) time.Duration {
@@ -262,9 +362,7 @@ func classifyHTTPProbeError(err error, ctxErr error) string {
 }
 
 func failedProbeSamples(count int, errText string) []ProbeSample {
-	if count <= 0 {
-		return nil
-	}
+	count = normalizedProbeCount(count)
 	samples := make([]ProbeSample, 0, count)
 	for seq := 1; seq <= count; seq++ {
 		samples = append(samples, ProbeSample{Seq: seq, Success: false, Error: errText})
@@ -293,13 +391,24 @@ func classifyProbeError(err error) string {
 }
 
 func ProbeTargets(ctx context.Context, targets []ProbeTarget, ts time.Time) []ProbeRound {
+	targets = LimitProbeTargetsForRun(targets)
 	rounds := make([]ProbeRound, len(targets))
 	var wg sync.WaitGroup
+	concurrency := maxConcurrentProbeTargets
+	if concurrency > len(targets) {
+		concurrency = len(targets)
+	}
+	if concurrency < 1 {
+		return rounds
+	}
+	semaphore := make(chan struct{}, concurrency)
 	for index, target := range targets {
 		index, target := index, target
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			var samples []ProbeSample
 			switch target.Type {
@@ -312,11 +421,21 @@ func ProbeTargets(ctx context.Context, targets []ProbeTarget, ts time.Time) []Pr
 			default:
 				samples = failedProbeSamples(target.Count, fmt.Sprintf("unsupported_%s", target.Type))
 			}
-			rounds[index] = ProbeRound{TargetID: target.ID, TS: ts, Type: target.Type, Samples: samples}
+			rounds[index] = ProbeRound{RoundID: newProbeRoundID(ts, target.ID, index), TargetID: target.ID, TS: ts, Type: target.Type, Samples: samples}
 		}()
 	}
 	wg.Wait()
 	return rounds
+}
+
+func newProbeRoundID(ts time.Time, targetID string, index int) string {
+	var randomBytes [16]byte
+	if _, err := rand.Read(randomBytes[:]); err == nil {
+		return hex.EncodeToString(randomBytes[:])
+	}
+	fallback := fmt.Sprintf("%d:%s:%d:%d", ts.UnixNano(), targetID, index, probeRoundSequence.Add(1))
+	digest := sha256.Sum256([]byte(fallback))
+	return hex.EncodeToString(digest[:16])
 }
 
 func parseKeyValueLines(content string) map[string]string {
