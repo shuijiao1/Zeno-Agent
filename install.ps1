@@ -252,8 +252,27 @@ function Restore-PreviousBinary($Backup, $Destination, $ServiceName) {
   }
 }
 
+function Assert-ControllerURL($Value) {
+  $parsed = $null
+  if (-not [Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$parsed)) {
+    Fail 'ZENO_CONTROLLER_URL 不是有效的绝对 URL'
+  }
+  if ($parsed.UserInfo -or $parsed.Query -or $parsed.Fragment) {
+    Fail 'ZENO_CONTROLLER_URL 不能包含凭据、查询参数或片段'
+  }
+  if ($parsed.Scheme -eq 'https') { return }
+  if ($parsed.Scheme -eq 'http') {
+    $address = $null
+    $isLoopbackAddress = [Net.IPAddress]::TryParse($parsed.DnsSafeHost, [ref]$address) -and [Net.IPAddress]::IsLoopback($address)
+    if ($parsed.DnsSafeHost -eq 'localhost' -or $isLoopbackAddress) { return }
+  }
+  if ($parsed.Scheme -eq 'http') { Fail '远程 ZENO_CONTROLLER_URL 必须使用 https' }
+  Fail 'ZENO_CONTROLLER_URL 必须使用 http 或 https'
+}
+
 if (-not $ControllerURL) { Fail '必须设置 ZENO_CONTROLLER_URL' }
 if (-not $NodeID) { Fail '必须设置 ZENO_NODE_ID' }
+Assert-ControllerURL $ControllerURL
 $ExistingTokenUsable = (Test-Path -LiteralPath $TokenFile -PathType Leaf) -and ((Get-Item -LiteralPath $TokenFile).Length -gt 0)
 if (-not $Token -and -not $ExistingTokenUsable) { Fail '必须设置 ZENO_AGENT_TOKEN 或提供已有非空 token 文件' }
 
@@ -378,6 +397,10 @@ try {
   if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
   & sc.exe sidtype $ServiceName unrestricted | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
+  if (-not $Existing) {
+    & sc.exe privs $ServiceName SeChangeNotifyPrivilege | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务权限收敛配置失败' }
+  }
   & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName

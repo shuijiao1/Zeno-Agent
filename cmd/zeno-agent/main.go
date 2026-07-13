@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,10 +20,9 @@ const defaultStateInterval = 3 * time.Second
 const defaultHeartbeatInterval = 15 * time.Second
 const defaultHostInterval = 30 * time.Minute
 const defaultIdentityRefreshInterval = 12 * time.Hour
+const defaultProbeConfigPollInterval = time.Minute
 
-// Kept as compatibility aliases for older tests/install commands.
-const defaultReportInterval = defaultStateInterval
-const defaultFullReportInterval = defaultHeartbeatInterval
+var probeConfigPollInterval = defaultProbeConfigPollInterval
 
 type config struct {
 	ControllerURL           string
@@ -93,6 +93,9 @@ func normalizeConfigIntervals(cfg *config) {
 
 func run(ctx context.Context, cfg config) error {
 	normalizeConfigIntervals(&cfg)
+	if err := agent.ValidateControllerURL(cfg.ControllerURL); err != nil {
+		return err
+	}
 	client := agent.NewClient(cfg.ControllerURL, cfg.NodeID, cfg.Token)
 	collector := agent.NewMetricsCollector(agent.MetricsOptions{NetworkInterfaceAllowlist: splitCommaList(cfg.NetworkInterfaces), DiskMountAllowlist: splitCommaList(cfg.DiskMounts)})
 	probeManager := newProbeTargetManager()
@@ -122,12 +125,13 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	go client.RunPresence(ctx, refreshProbeConfig)
+	go runProbeConfigPoller(ctx, refreshProbeConfig)
 	go runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error { return reportState(ctx, client, collector) }, "state report")
 	go runPeriodic(ctx, cfg.HeartbeatInterval, func(ctx context.Context) error { return reportHeartbeat(ctx, client, cfg.Version) }, "heartbeat report")
 	go runPeriodic(ctx, cfg.HostInterval, func(ctx context.Context) error {
 		return reportHost(ctx, client, collector, cfg.Version, identityDiscoverer)
 	}, "host report")
-	go runPeriodicWithTimeout(ctx, time.Second, 30*time.Second, func(ctx context.Context) error { return runDueProbes(ctx, client, probeManager) }, "probe report")
+	go runPeriodicWithTimeout(ctx, time.Second, maxProbeRunLoopTimeout(), func(ctx context.Context) error { return runDueProbes(ctx, client, probeManager) }, "probe report")
 
 	<-ctx.Done()
 	return ctx.Err()
@@ -165,6 +169,13 @@ func perCallTimeout(interval time.Duration) time.Duration {
 		return interval
 	}
 	return 30 * time.Second
+}
+
+func runProbeConfigPoller(ctx context.Context, refreshProbeConfig func(context.Context, int64) (int64, error)) {
+	runPeriodic(ctx, probeConfigPollInterval, func(ctx context.Context) error {
+		_, err := refreshProbeConfig(ctx, 0)
+		return err
+	}, "probe config refresh")
 }
 
 type networkIdentityDiscoverer interface {
@@ -233,11 +244,12 @@ func reportStateOnly(ctx context.Context, client *agent.Client, collector *agent
 }
 
 type probeTargetManager struct {
-	mu         sync.Mutex
-	targets    []agent.ProbeTarget
-	version    int64
-	generation uint64
-	scheduler  *agent.ProbeScheduler
+	mu          sync.Mutex
+	targets     []agent.ProbeTarget
+	version     int64
+	initialized bool
+	generation  uint64
+	scheduler   *agent.ProbeScheduler
 }
 
 type probeTargetBatch struct {
@@ -250,17 +262,33 @@ func newProbeTargetManager() *probeTargetManager {
 	return &probeTargetManager{scheduler: agent.NewProbeScheduler()}
 }
 
-func (m *probeTargetManager) update(targets []agent.ProbeTarget, version int64) {
+func (m *probeTargetManager) update(targets []agent.ProbeTarget, version int64) error {
+	if version < 0 {
+		return fmt.Errorf("invalid probe config version %d", version)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sanitized := agent.SanitizeProbeTargets(targets)
+	if m.initialized {
+		if m.version > 0 && version == 0 {
+			return fmt.Errorf("probe config version 0 cannot overwrite current version %d", m.version)
+		}
+		if version < m.version {
+			return fmt.Errorf("probe config version %d is older than current version %d", version, m.version)
+		}
+		if m.version > 0 && version == m.version && !sameProbeTargets(m.targets, sanitized) {
+			return fmt.Errorf("probe config version %d has different content", version)
+		}
+	}
 	changed := version != m.version || !sameProbeTargets(m.targets, sanitized)
 	m.targets = append(m.targets[:0], sanitized...)
+	m.initialized = true
 	if changed {
 		m.scheduler = agent.NewProbeScheduler()
 		m.version = version
 		m.generation++
 	}
+	return nil
 }
 
 func (m *probeTargetManager) due(now time.Time) probeTargetBatch {
@@ -297,7 +325,9 @@ func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *pro
 	if requestedVersion > 0 && response.Version < requestedVersion {
 		return 0, fmt.Errorf("probe config version %d is older than requested version %d", response.Version, requestedVersion)
 	}
-	manager.update(response.Targets, response.Version)
+	if err := manager.update(response.Targets, response.Version); err != nil {
+		return 0, err
+	}
 	return response.Version, nil
 }
 
@@ -307,7 +337,13 @@ func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTarge
 	if len(batch.targets) == 0 {
 		return nil
 	}
-	rounds := agent.ProbeTargets(ctx, batch.targets, now)
+	probeTimeout := agent.ProbeRunTimeout(batch.targets)
+	if probeTimeout <= 0 {
+		probeTimeout = 5 * time.Second
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
+	rounds := agent.ProbeTargets(probeCtx, batch.targets, now)
+	cancelProbe()
 	for index := range rounds {
 		rounds[index].ConfigVersion = batch.version
 	}
@@ -315,13 +351,27 @@ func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTarge
 		log.Printf("probe config changed while probes were running; discarded %d stale result round(s) for version %d", len(rounds), batch.version)
 		return nil
 	}
-	if err := client.PostProbeResults(ctx, rounds); err != nil {
+	uploadCtx, cancelUpload := context.WithTimeout(ctx, agent.ProbeUploadTimeout())
+	err := client.PostProbeResults(uploadCtx, rounds)
+	cancelUpload()
+	if err != nil {
+		if agent.IsAgentAPIStatus(err, http.StatusConflict) {
+			refreshCtx, cancelRefresh := context.WithTimeout(ctx, 20*time.Second)
+			if _, refreshErr := refreshProbeTargets(refreshCtx, client, manager, batch.version+1); refreshErr != nil {
+				log.Printf("probe result upload returned 409; config refresh failed: %v", refreshErr)
+			}
+			cancelRefresh()
+		}
 		return err
 	}
-	if !manager.markCompleted(batch, now) {
+	if !manager.markCompleted(batch, time.Now().UTC()) {
 		log.Printf("probe config changed while probe results were uploading; skipped stale completion mark for version %d", batch.version)
 	}
 	return nil
+}
+
+func maxProbeRunLoopTimeout() time.Duration {
+	return time.Duration(120_000)*time.Millisecond + agent.ProbeUploadTimeout() + 5*time.Second
 }
 
 func sameProbeTargets(left, right []agent.ProbeTarget) bool {

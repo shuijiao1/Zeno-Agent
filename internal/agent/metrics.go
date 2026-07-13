@@ -63,6 +63,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 	load1, load5, load15 := readLoadAverages(cpu, runtime.NumCPU())
 	diskUsed, diskTotal := diskUsage(c.diskAllowlist)
 	netTotals := readNetworkTotals(c.networkAllowlist)
+	tcpConnections, udpConnections := connectionCounts()
 	var inSpeed, outSpeed float64
 	if c.hasNet {
 		elapsed := now.Sub(c.previousNetAt).Seconds()
@@ -75,7 +76,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 	c.previousNetAt = now
 	c.hasNet = true
 
-	return StateSample{
+	sample := StateSample{
 		TS:                 now.UTC().Unix(),
 		CPUPercent:         cpu,
 		Load1:              load1,
@@ -92,10 +93,11 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 		NetInSpeedBps:      inSpeed,
 		NetOutSpeedBps:     outSpeed,
 		ProcessCount:       processCount(),
-		TCPConnectionCount: tcpConnectionCount(),
-		UDPConnectionCount: udpConnectionCount(),
+		TCPConnectionCount: tcpConnections,
+		UDPConnectionCount: udpConnections,
 		UptimeSeconds:      uptimeSeconds(),
 	}
+	return withNewStateSampleIdentifiers(sample, now)
 }
 
 func (c *MetricsCollector) cpuPercent() float64 {
@@ -133,6 +135,9 @@ type cpuTimes struct {
 func readCPUTimes() (cpuTimes, bool) {
 	if runtime.GOOS == "windows" {
 		return windowsReadCPUTimes()
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinReadCPUTimes()
 	}
 	content, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -206,6 +211,9 @@ func readLoadAverages(cpuPercent float64, cpuCores int) (load1, load5, load15 fl
 	if runtime.GOOS == "windows" {
 		return windowsLoadAverages(cpuPercent, cpuCores)
 	}
+	if runtime.GOOS == "darwin" {
+		return darwinLoadAverages()
+	}
 	content, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
 		return 0, 0, 0
@@ -223,6 +231,9 @@ func readLoadAverages(cpuPercent float64, cpuCores int) (load1, load5, load15 fl
 func processCount() int64 {
 	if runtime.GOOS == "windows" {
 		return windowsProcessCount()
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinProcessCount()
 	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -251,12 +262,15 @@ func processCount() int64 {
 	return count
 }
 
-func tcpConnectionCount() int64 {
-	return tcpConnectionCountFromFile("/proc/net/tcp") + tcpConnectionCountFromFile("/proc/net/tcp6")
-}
-
-func udpConnectionCount() int64 {
-	return tcpConnectionCountFromFile("/proc/net/udp") + tcpConnectionCountFromFile("/proc/net/udp6")
+func connectionCounts() (tcp int64, udp int64) {
+	if runtime.GOOS == "darwin" {
+		return darwinConnectionCounts()
+	}
+	if runtime.GOOS == "windows" {
+		return windowsConnectionCounts()
+	}
+	return tcpConnectionCountFromFile("/proc/net/tcp") + tcpConnectionCountFromFile("/proc/net/tcp6"),
+		tcpConnectionCountFromFile("/proc/net/udp") + tcpConnectionCountFromFile("/proc/net/udp6")
 }
 
 func tcpConnectionCountFromFile(path string) int64 {
@@ -282,6 +296,7 @@ var defaultExcludedInterfacePrefixes = []string{
 	"veth",
 	"br-",
 	"tun",
+	"utun",
 	"tailscale",
 	"kube",
 	"vmbr",
@@ -307,6 +322,9 @@ var defaultExcludedInterfacePrefixes = []string{
 func readNetworkTotals(allowlist map[string]struct{}) networkTotals {
 	if runtime.GOOS == "windows" {
 		return windowsNetworkTotals(allowlist)
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinNetworkTotals(allowlist)
 	}
 	content, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
@@ -387,6 +405,9 @@ func osRelease() (string, string) {
 	if runtime.GOOS == "windows" {
 		return windowsOSRelease()
 	}
+	if runtime.GOOS == "darwin" {
+		return darwinOSRelease()
+	}
 	content, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return "linux", ""
@@ -403,6 +424,9 @@ func kernelRelease() string {
 	if runtime.GOOS == "windows" {
 		return windowsKernelRelease()
 	}
+	if runtime.GOOS == "darwin" {
+		return darwinKernelRelease()
+	}
 	content, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil {
 		return ""
@@ -413,6 +437,9 @@ func kernelRelease() string {
 func virtualizationName() string {
 	if runtime.GOOS == "windows" {
 		return windowsVirtualizationName()
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinVirtualizationName()
 	}
 	for _, path := range []string{"/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"} {
 		content, err := os.ReadFile(path)
@@ -429,6 +456,9 @@ func virtualizationName() string {
 func cpuModel() string {
 	if runtime.GOOS == "windows" {
 		return windowsCPUModel()
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinCPUModel()
 	}
 	content, err := os.ReadFile("/proc/cpuinfo")
 	if err != nil {
@@ -449,6 +479,9 @@ func bootTime() int64 {
 	if runtime.GOOS == "windows" {
 		return windowsBootTime()
 	}
+	if runtime.GOOS == "darwin" {
+		return darwinBootTime()
+	}
 	content, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0
@@ -467,6 +500,9 @@ func bootTime() int64 {
 func uptimeSeconds() int64 {
 	if runtime.GOOS == "windows" {
 		return windowsUptimeSeconds()
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinUptimeSeconds()
 	}
 	content, err := os.ReadFile("/proc/uptime")
 	if err != nil {

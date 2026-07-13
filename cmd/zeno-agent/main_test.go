@@ -163,7 +163,7 @@ func TestRunDueProbesDiscardsStaleGenerationBeforeUpload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	manager.update([]agent.ProbeTarget{{ID: "old", Type: "http_get", Address: server.URL + "/slow", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "http_get", Address: server.URL + "/slow", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
 	client := agent.NewClient(server.URL, "hytron", "token")
 	errCh := make(chan error, 1)
 	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
@@ -173,7 +173,7 @@ func TestRunDueProbesDiscardsStaleGenerationBeforeUpload(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("slow probe did not start")
 	}
-	manager.update([]agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
 	close(releaseSlowProbe)
 
 	select {
@@ -195,7 +195,7 @@ func TestRunDueProbesDiscardsStaleGenerationBeforeUpload(t *testing.T) {
 
 func TestRunDueProbesPostsConfigVersionAndSkipsStaleCompletion(t *testing.T) {
 	manager := newProbeTargetManager()
-	manager.update([]agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -207,7 +207,7 @@ func TestRunDueProbesPostsConfigVersionAndSkipsStaleCompletion(t *testing.T) {
 			if payload.ConfigVersion != 1 || len(payload.Rounds) != 1 {
 				t.Fatalf("probe result payload = %+v, want config version 1", payload)
 			}
-			manager.update([]agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
+			mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
 			w.WriteHeader(http.StatusAccepted)
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -240,7 +240,7 @@ func TestRefreshProbeTargetsRequiresRequestedConfigVersion(t *testing.T) {
 	defer server.Close()
 
 	manager := newProbeTargetManager()
-	manager.update([]agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 5)
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 5)
 	client := agent.NewClient(server.URL, "hytron", "token")
 
 	if applied, err := refreshProbeTargets(context.Background(), client, manager, 7); err == nil || applied != 0 {
@@ -263,5 +263,147 @@ func TestRefreshProbeTargetsRequiresRequestedConfigVersion(t *testing.T) {
 	responseVersion.Store(0)
 	if applied, err := refreshProbeTargets(context.Background(), client, manager, 8); err == nil || applied != 0 {
 		t.Fatalf("version zero refresh applied=%d err=%v, want rejected", applied, err)
+	}
+}
+
+func mustUpdateProbeTargets(t *testing.T, manager *probeTargetManager, targets []agent.ProbeTarget, version int64) {
+	t.Helper()
+	if err := manager.update(targets, version); err != nil {
+		t.Fatalf("manager.update(version=%d): %v", version, err)
+	}
+}
+
+func TestProbeTargetManagerAppliesLegacyVersionZeroMutableConfig(t *testing.T) {
+	manager := newProbeTargetManager()
+	now := time.Now().UTC()
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 0)
+
+	oldBatch := manager.due(now)
+	if len(oldBatch.targets) != 1 || oldBatch.targets[0].ID != "old" || oldBatch.version != 0 {
+		t.Fatalf("initial legacy batch = %+v, want old version 0 target", oldBatch)
+	}
+	if !manager.markCompleted(oldBatch, now) {
+		t.Fatal("markCompleted rejected current legacy batch")
+	}
+	if batch := manager.due(now.Add(time.Second)); len(batch.targets) != 0 {
+		t.Fatalf("legacy target due immediately after completion = %+v, want none", batch)
+	}
+
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 0)
+	newBatch := manager.due(now.Add(2 * time.Second))
+	if len(newBatch.targets) != 1 || newBatch.targets[0].ID != "new" || newBatch.version != 0 {
+		t.Fatalf("mutable legacy batch after content change = %+v, want new version 0 target", newBatch)
+	}
+	if newBatch.generation <= oldBatch.generation {
+		t.Fatalf("legacy content change generation = %d, want greater than %d", newBatch.generation, oldBatch.generation)
+	}
+}
+
+func TestProbeTargetManagerRejectsRollbackZeroAndSameVersionDrift(t *testing.T) {
+	manager := newProbeTargetManager()
+	original := []agent.ProbeTarget{{ID: "target", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}
+	mustUpdateProbeTargets(t, manager, original, 5)
+
+	if err := manager.update([]agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 4); err == nil {
+		t.Fatal("manager accepted an older probe config version")
+	}
+	if err := manager.update(nil, 0); err == nil {
+		t.Fatal("manager accepted version 0 over an initialized non-zero config")
+	}
+	if err := manager.update([]agent.ProbeTarget{{ID: "target", Type: "unsupported", Count: 2, TimeoutMS: 1000, IntervalSec: 60}}, 5); err == nil {
+		t.Fatal("manager accepted different content with the same config version")
+	}
+
+	batch := manager.due(time.Now().UTC())
+	if batch.version != 5 || len(batch.targets) != 1 || batch.targets[0].Count != 1 {
+		t.Fatalf("manager changed after rejected configs: %+v", batch)
+	}
+	if err := manager.update(original, 5); err != nil {
+		t.Fatalf("manager rejected idempotent same-version config: %v", err)
+	}
+}
+
+func TestRunDueProbesRefreshesProbeConfigOnUploadConflict(t *testing.T) {
+	manager := newProbeTargetManager()
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 1)
+	var fetches atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/v1/probe-results":
+			w.WriteHeader(http.StatusConflict)
+		case "/api/agent/v1/probe-targets":
+			fetches.Add(1)
+			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 2, Targets: []agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := agent.NewClient(server.URL, "hytron", "token")
+	if err := runDueProbes(context.Background(), client, manager); err == nil {
+		t.Fatal("runDueProbes returned nil, want upload conflict")
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("probe config fetches after 409 = %d, want 1", fetches.Load())
+	}
+	batch := manager.due(time.Now().UTC())
+	if batch.version != 2 || len(batch.targets) != 1 || batch.targets[0].ID != "new" {
+		t.Fatalf("manager after 409 refresh = %+v, want version 2 new target", batch)
+	}
+}
+
+func TestRunDueProbesMarksSchedulerCompletionAfterUpload(t *testing.T) {
+	manager := newProbeTargetManager()
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 5}}, 1)
+	uploadDelay := 300 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/probe-results" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		time.Sleep(uploadDelay)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := agent.NewClient(server.URL, "hytron", "token")
+	before := time.Now().UTC()
+	if err := runDueProbes(context.Background(), client, manager); err != nil {
+		t.Fatalf("runDueProbes: %v", err)
+	}
+	batch := manager.due(before.Add(5*time.Second + uploadDelay/2))
+	if len(batch.targets) != 0 {
+		t.Fatalf("target due too early after upload-delayed completion mark: %+v", batch)
+	}
+}
+
+func TestProbeConfigPollerRetriesWhenPresenceIsUnavailable(t *testing.T) {
+	oldInterval := probeConfigPollInterval
+	probeConfigPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { probeConfigPollInterval = oldInterval })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var attempts atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		runProbeConfigPoller(ctx, func(context.Context, int64) (int64, error) {
+			attempt := attempts.Add(1)
+			if attempt == 1 {
+				return 0, context.DeadlineExceeded
+			}
+			cancel()
+			return 2, nil
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("probe config poller did not stop after context cancellation")
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("probe config poll attempts = %d, want retry after failure", attempts.Load())
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,12 +23,66 @@ type Client struct {
 
 const maxAgentAPIJSONBodyBytes int64 = 1 << 20
 
+type AgentAPIStatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+}
+
+func (e *AgentAPIStatusError) Error() string {
+	return fmt.Sprintf("agent api %s %s returned %d", e.Method, e.Path, e.StatusCode)
+}
+
+func IsAgentAPIStatus(err error, statusCode int) bool {
+	var statusErr *AgentAPIStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == statusCode
+}
+
 func NewClient(baseURL, nodeID, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		nodeID:  strings.TrimSpace(nodeID),
 		token:   strings.TrimSpace(token),
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    newAgentHTTPClient(),
+	}
+}
+
+func newAgentHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		// Agent API requests carry the bearer token. Do not follow redirects:
+		// Go may otherwise resend headers to a different endpoint, downgrade
+		// HTTPS to HTTP, or convert POST to GET for 301/302/303 responses.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: transport,
+	}
+}
+
+func ValidateControllerURL(baseURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
+		return fmt.Errorf("invalid controller url")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("controller url must not contain credentials, query, or fragment")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+		if hostname == "localhost" {
+			return nil
+		}
+		if address := net.ParseIP(hostname); address != nil && address.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("remote controller url must use https")
+	default:
+		return fmt.Errorf("controller url must use http or https")
 	}
 }
 
@@ -39,6 +95,7 @@ func (c *Client) PostHost(ctx context.Context, host HostInfo) error {
 }
 
 func (c *Client) PostState(ctx context.Context, state StateSample) error {
+	state = ensureStateSampleIdentifiers(state)
 	return c.doJSON(ctx, http.MethodPost, "/api/agent/v1/state", state, nil)
 }
 
@@ -97,6 +154,9 @@ func commonProbeConfigVersion(rounds []ProbeRound) (int64, error) {
 }
 
 func (c *Client) PresenceWebSocketURL() (string, error) {
+	if err := ValidateControllerURL(c.baseURL); err != nil {
+		return "", err
+	}
 	parsed, err := url.Parse(c.baseURL)
 	if err != nil {
 		return "", err
@@ -106,7 +166,6 @@ func (c *Client) PresenceWebSocketURL() (string, error) {
 		parsed.Scheme = "ws"
 	case "https":
 		parsed.Scheme = "wss"
-	case "ws", "wss":
 	default:
 		return "", fmt.Errorf("unsupported controller url scheme %q", parsed.Scheme)
 	}
@@ -124,6 +183,9 @@ func (c *Client) setAuthHeaders(header http.Header) {
 func (c *Client) doJSON(ctx context.Context, method, path string, requestValue any, responseValue any) error {
 	if c.baseURL == "" || c.nodeID == "" || c.token == "" {
 		return fmt.Errorf("controller url, node id, and token are required")
+	}
+	if err := ValidateControllerURL(c.baseURL); err != nil {
+		return err
 	}
 	var body io.Reader
 	if requestValue != nil {
@@ -151,7 +213,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestValue a
 		// large or contain a proxy error page with credentials. Drain only a small
 		// bounded prefix for connection reuse and report status/path without body.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("agent api %s %s returned %d", method, path, resp.StatusCode)
+		return &AgentAPIStatusError{Method: method, Path: path, StatusCode: resp.StatusCode}
 	}
 	if responseValue == nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))

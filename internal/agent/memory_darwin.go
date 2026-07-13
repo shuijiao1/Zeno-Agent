@@ -3,7 +3,6 @@
 package agent
 
 import (
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,11 +26,11 @@ func platformMemoryTotals() (total int64, available int64) {
 }
 
 func platformSwapTotals() (total int64, free int64) {
-	output, err := exec.Command("sysctl", "-n", "vm.swapusage").Output()
+	output, err := darwinCommandOutput("/usr/sbin/sysctl", "-n", "vm.swapusage")
 	if err != nil {
 		return 0, 0
 	}
-	return parseDarwinSwapUsage(string(output))
+	return parseDarwinSwapUsage(output)
 }
 
 func darwinAvailableMemory() int64 {
@@ -57,18 +56,18 @@ func darwinPageCount(name string) (uint64, bool) {
 }
 
 func darwinAvailableMemoryFromVMStat() int64 {
-	output, err := exec.Command("vm_stat").Output()
+	output, err := darwinCommandOutput("/usr/bin/vm_stat")
 	if err != nil {
 		return 0
 	}
 	pageSize := int64(4096)
-	if match := regexp.MustCompile(`page size of (\d+) bytes`).FindStringSubmatch(string(output)); len(match) == 2 {
+	if match := regexp.MustCompile(`page size of (\d+) bytes`).FindStringSubmatch(output); len(match) == 2 {
 		if value, err := strconv.ParseInt(match[1], 10, 64); err == nil && value > 0 {
 			pageSize = value
 		}
 	}
 	var pages int64
-	for _, line := range strings.Split(string(output), "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		name, value, ok := strings.Cut(line, ":")
 		if !ok {
 			continue

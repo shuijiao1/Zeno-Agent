@@ -10,6 +10,47 @@ import (
 	"time"
 )
 
+func TestValidateControllerURLRequiresTLSForRemoteHosts(t *testing.T) {
+	valid := []string{
+		"https://zeno.example.com",
+		"http://localhost:18980",
+		"http://localhost.:18980",
+		"http://127.0.0.1:18980",
+		"http://127.0.0.2:18980",
+		"http://[::1]:18980",
+		"http://[::ffff:127.0.0.1]:18980",
+		"http://[::ffff:7f00:1]:18980",
+	}
+	for _, value := range valid {
+		if err := ValidateControllerURL(value); err != nil {
+			t.Fatalf("ValidateControllerURL(%q) = %v, want valid", value, err)
+		}
+	}
+	invalid := []string{
+		"http://zeno.example.com",
+		"http://localhost.example.com",
+		"http://127.0.0.1.evil.example",
+		"http://[::ffff:192.168.1.1]:18980",
+		"ws://127.0.0.1:18980",
+		"https://user:pass@zeno.example.com",
+		"https://zeno.example.com?token=secret",
+		"not a url",
+	}
+	for _, value := range invalid {
+		if err := ValidateControllerURL(value); err == nil {
+			t.Fatalf("ValidateControllerURL(%q) succeeded, want rejection", value)
+		}
+	}
+}
+
+func TestClientRejectsRemotePlainHTTPBeforeSendingToken(t *testing.T) {
+	client := NewClient("http://198.51.100.10:18980", "node", "secret-token")
+	err := client.PostHeartbeat(context.Background(), "online", "test", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("PostHeartbeat error = %v, want remote HTTP rejection", err)
+	}
+}
+
 func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 	var sawPath, sawNode, sawAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -19,6 +60,9 @@ func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 		var body StateSample
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode state body: %v", err)
+		}
+		if body.SampleID == "" || body.IdempotencyKey != body.SampleID {
+			t.Fatalf("state id fields = sample_id %q idempotency_key %q, want matching generated ids", body.SampleID, body.IdempotencyKey)
 		}
 		if body.TS != 1782990000 || body.CPUPercent != 12.5 || body.Load1 != 0.42 || body.Load5 != 0.35 || body.Load15 != 0.28 || body.SwapUsedBytes != 512 || body.SwapTotalBytes != 2048 || body.ProcessCount != 88 || body.TCPConnectionCount != 34 || body.UDPConnectionCount != 12 || body.NetOutSpeedBps != 1024 {
 			t.Fatalf("state body = %+v, want exact sample with extra metrics", body)
@@ -48,6 +92,40 @@ func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 	}
 	if sawPath != "/api/agent/v1/state" || sawNode != "hytron" || sawAuth != "Bearer secret-token" {
 		t.Fatalf("path/node/auth = %q/%q/%q, want state/hytron/bearer", sawPath, sawNode, sawAuth)
+	}
+}
+
+func TestClientPostStateReusesGeneratedIDForSameSampleRetry(t *testing.T) {
+	var ids []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/state" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var body StateSample
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode state body: %v", err)
+		}
+		if body.SampleID == "" || body.IdempotencyKey != body.SampleID {
+			t.Fatalf("state id fields = sample_id %q idempotency_key %q, want matching generated ids", body.SampleID, body.IdempotencyKey)
+		}
+		ids = append(ids, body.SampleID)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "hytron", "secret-token")
+	sample := StateSample{TS: 1782990000, CPUPercent: 12.5, MemoryUsedBytes: 1024, MemoryTotalBytes: 2048, DiskUsedBytes: 4096, DiskTotalBytes: 8192, NetInTotalBytes: 10, NetOutTotalBytes: 20, UptimeSeconds: 30}
+	if err := client.PostState(context.Background(), sample); err != nil {
+		t.Fatalf("first post state: %v", err)
+	}
+	if err := client.PostState(context.Background(), sample); err != nil {
+		t.Fatalf("retry post state: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("posted ids = %+v, want two posts", ids)
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("same sample retry ids = %q then %q, want stable id", ids[0], ids[1])
 	}
 }
 
@@ -147,5 +225,31 @@ func TestClientRejectsOversizedJSONResponse(t *testing.T) {
 	_, err := client.FetchProbeTargets(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
 		t.Fatalf("error = %v, want bounded response error", err)
+	}
+}
+
+func TestClientDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
+	var leakHits int
+	leakServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHits++
+		if r.Header.Get("Authorization") != "" {
+			t.Fatalf("redirect target received Authorization header %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer leakServer.Close()
+
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leakServer.URL+"/leak", http.StatusFound)
+	}))
+	defer redirectServer.Close()
+
+	client := NewClient(redirectServer.URL, "node", "secret-token")
+	err := client.PostHeartbeat(context.Background(), "online", "test", time.Now())
+	if err == nil || !IsAgentAPIStatus(err, http.StatusFound) {
+		t.Fatalf("PostHeartbeat error = %v, want local 302 status error", err)
+	}
+	if leakHits != 0 {
+		t.Fatalf("redirect target hit count = %d, want 0", leakHits)
 	}
 }

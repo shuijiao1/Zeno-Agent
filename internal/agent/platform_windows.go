@@ -4,8 +4,8 @@ package agent
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -55,14 +55,10 @@ func filetimeUint64(value filetime) uint64 {
 }
 
 func windowsLoadAverages(cpuPercent float64, cpuCores int) (float64, float64, float64) {
-	if cpuCores <= 0 {
-		cpuCores = runtime.NumCPU()
-	}
-	if cpuPercent < 0 {
-		cpuPercent = 0
-	}
-	load := cpuPercent * float64(cpuCores) / 100
-	return load, load, load
+	// Windows does not expose Unix-style 1/5/15 minute runnable-queue load
+	// averages. Reporting instantaneous CPU as load looked precise but had a
+	// different meaning, so leave these fields unset and rely on CPUPercent.
+	return 0, 0, 0
 }
 
 func windowsProcessCount() int64 {
@@ -83,6 +79,28 @@ func windowsProcessCount() int64 {
 		}
 	}
 	return count
+}
+
+func windowsConnectionCounts() (tcp int64, udp int64) {
+	return windowsIPTableCount(getTcpTable2) + windowsIPTableCount(getTcp6Table2),
+		windowsIPTableCount(getUdpTable) + windowsIPTableCount(getUdp6Table)
+}
+
+func windowsIPTableCount(proc *syscall.LazyProc) int64 {
+	if err := proc.Find(); err != nil {
+		return 0
+	}
+	var size uint32
+	result, _, _ := proc.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	if result != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) || size < 4 {
+		return 0
+	}
+	buffer := make([]byte, size)
+	result, _, _ = proc.Call(uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0)
+	if result != 0 || size < 4 {
+		return 0
+	}
+	return int64(*(*uint32)(unsafe.Pointer(&buffer[0])))
 }
 
 func windowsNetworkTotals(allowlist map[string]struct{}) networkTotals {

@@ -40,10 +40,20 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"$dest.bak-$(date -u +%Y%m%d%H%M%S)",
 		"chown root:root \"$unit\"",
 		"chown root:wheel \"$plist\"",
+		"plutil -lint \"$plist_tmp\"",
 		"NoNewPrivileges=true",
 		"ProtectSystem=full",
 		"ProtectHome=read-only",
 		"ProtectKernelTunables=true",
+		"PrivateDevices=true",
+		"CapabilityBoundingSet=CAP_NET_RAW",
+		"AmbientCapabilities=CAP_NET_RAW",
+		"RestrictNamespaces=true",
+		"MemoryDenyWriteExecute=true",
+		"ProcessType</key><string>Background",
+		"<key>Umask</key><integer>63</integer>",
+		"validate_controller_url",
+		"远程 ZENO_CONTROLLER_URL 必须使用 https",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("install.sh missing %q", want)
@@ -99,6 +109,49 @@ func TestUnixSystemdEscapeBehavior(t *testing.T) {
 	}
 }
 
+func TestUnixControllerURLValidation(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	script := string(content)
+	fragment := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "is_decimal_octet") + "\n" +
+		extractShellFunction(t, script, "is_ipv4_loopback") + "\n" +
+		extractShellFunction(t, script, "is_hex16") + "\n" +
+		extractShellFunction(t, script, "is_ipv4_mapped_hex_loopback") + "\n" +
+		extractShellFunction(t, script, "is_ipv4_mapped_loopback") + "\n" +
+		extractShellFunction(t, script, "controller_url_host") + "\n" +
+		extractShellFunction(t, script, "validate_controller_url") + "\n"
+	for _, value := range []string{"https://zeno.example.com", "http://localhost:18980", "http://localhost.:18980", "http://127.0.0.1:18980", "http://127.0.0.2:18980", "http://127.255.255.255:18980", "http://[::1]:18980", "http://[::ffff:127.0.0.1]:18980", "http://[::ffff:7f00:1]:18980"} {
+		cmd := exec.Command("bash", "-c", fragment+"validate_controller_url \"$1\"", "bash", value)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("validate_controller_url rejected %q: %v\n%s", value, err, out)
+		}
+	}
+	for _, value := range []string{
+		"http://zeno.example.com",
+		"http://localhost.example.com",
+		"http://user@localhost:18980",
+		"http://127.evil.example",
+		"http://127.0.0.1.evil.example",
+		"http://127.0.0.256:18980",
+		"http://[::ffff:192.168.1.1]:18980",
+		"http://[::ffff:8000:1]:18980",
+		"http://[::1]evil:18980",
+		"https://user:pass@zeno.example.com",
+		"https://zeno.example.com?token=secret",
+		"https://zeno.example.com#fragment",
+		"https://:443",
+		"ftp://zeno.example.com",
+	} {
+		cmd := exec.Command("bash", "-c", fragment+"validate_controller_url \"$1\"", "bash", value)
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("validate_controller_url accepted %q", value)
+		}
+	}
+}
+
 func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T) {
 	content, err := os.ReadFile("install.ps1")
 	if err != nil {
@@ -134,9 +187,12 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"$RecoveryBackupPath",
 		"zeno-agent.exe.rollback-",
 		"sc.exe sidtype",
+		"sc.exe privs $ServiceName SeChangeNotifyPrivilege",
 		"拒绝覆盖现有二进制",
 		"原备份仍保留在",
 		"token 文件恢复失败，备份仍保留在",
+		"Assert-ControllerURL",
+		"远程 ZENO_CONTROLLER_URL 必须使用 https",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("install.ps1 missing %q", want)

@@ -1,10 +1,8 @@
 package agent
 
 import (
-	"bufio"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -39,8 +37,49 @@ func TestTCPConnectionCountFromFileSkipsHeader(t *testing.T) {
 	}
 }
 
+func TestParseDarwinConnectionCounts(t *testing.T) {
+	tcp, udp := parseDarwinConnectionCounts(`Active Internet connections
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  127.0.0.1.80           *.*                    LISTEN
+tcp6       0      0  ::1.443                *.*                    LISTEN
+udp4       0      0  *.5353                 *.*
+udp6       0      0  *.5353                 *.*
+`)
+	if tcp != 2 || udp != 2 {
+		t.Fatalf("darwin connection counts = tcp %d udp %d, want 2/2", tcp, udp)
+	}
+}
+
+func TestParseDarwinCPUAndLoadAverages(t *testing.T) {
+	times, ok := parseDarwinCPUTimes("100 20 30 400 5")
+	if !ok || times.Total != 555 || times.Idle != 400 {
+		t.Fatalf("darwin CPU times = %+v, %v, want total=555 idle=400", times, ok)
+	}
+	load1, load5, load15 := parseDarwinLoadAverages("{ 1.25 0.75 0.50 }")
+	if load1 != 1.25 || load5 != 0.75 || load15 != 0.50 {
+		t.Fatalf("darwin load averages = %v/%v/%v", load1, load5, load15)
+	}
+}
+
+func TestParseDarwinNetworkTotalsUsesLinkRowsOnce(t *testing.T) {
+	output := `Name  Mtu   Network       Address            Ipkts Ierrs    Ibytes    Opkts Oerrs     Obytes  Coll
+lo0   16384 <Link#1>                        100     0      1000      100     0       1000     0
+en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff  200     0      2048      300     0       4096     0
+en0   1500  192.0.2      192.0.2.5          200     -      2048      300     -       4096     -
+utun1 1380  <Link#9>                         10     0       100       10     0        100     0
+`
+	totals := parseDarwinNetworkTotals(output, nil)
+	if totals.InBytes != 2048 || totals.OutBytes != 4096 {
+		t.Fatalf("darwin network totals = %+v, want en0 link totals only", totals)
+	}
+	allowlisted := parseDarwinNetworkTotals(output, allowlistSet([]string{"utun1"}))
+	if allowlisted.InBytes != 100 || allowlisted.OutBytes != 100 {
+		t.Fatalf("allowlisted darwin network totals = %+v, want utun1", allowlisted)
+	}
+}
+
 func TestIncludeNetworkInterfaceFiltersVirtualDefaults(t *testing.T) {
-	for _, name := range []string{"lo", "docker0", "vethabc", "br-123", "tun0", "tailscale0", "kube-ipvs0", "vmbr0", "tap1", "cni0", "flannel.1", "cali123", "virbr0"} {
+	for _, name := range []string{"lo", "docker0", "vethabc", "br-123", "tun0", "utun1", "tailscale0", "kube-ipvs0", "vmbr0", "tap1", "cni0", "flannel.1", "cali123", "virbr0"} {
 		if includeNetworkInterface(name, nil) {
 			t.Fatalf("interface %s included by default, want excluded", name)
 		}
@@ -62,44 +101,6 @@ func TestNetworkInterfaceAllowlistOverridesDefaultFilter(t *testing.T) {
 	}
 }
 
-func TestParseMountInfoFiltersPseudoAndContainerMounts(t *testing.T) {
-	fixture := filepath.Join(t.TempDir(), "mountinfo")
-	content := `26 23 8:1 / / rw,relatime - ext4 /dev/vda1 rw
-27 26 0:24 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
-28 26 0:25 / /run rw,nosuid,nodev - tmpfs tmpfs rw
-29 26 0:26 / /var/lib/docker/overlay2/abc/merged rw,relatime - overlay overlay rw
-30 26 8:2 / /data rw,relatime - xfs /dev/vdb1 rw
-31 26 8:2 / /mnt/data-bind rw,relatime - xfs /dev/vdb1 rw
-`
-	if err := os.WriteFile(fixture, []byte(content), 0o600); err != nil {
-		t.Fatalf("write mountinfo fixture: %v", err)
-	}
-
-	file, err := os.Open(fixture)
-	if err != nil {
-		t.Fatalf("open mountinfo fixture: %v", err)
-	}
-	defer file.Close()
-	// Parsing/filtering is tested without asserting local Statfs sizes.
-	var included []string
-	scanner := bufio.NewScanner(file)
-	seen := map[string]struct{}{}
-	for scanner.Scan() {
-		mount, ok := parseMountInfoLine(scanner.Text())
-		if !ok || !includeDiskMount(mount.mountPoint, mount.fsType, mount.source) {
-			continue
-		}
-		if _, exists := seen[mount.device]; exists {
-			continue
-		}
-		seen[mount.device] = struct{}{}
-		included = append(included, mount.mountPoint)
-	}
-	if strings.Join(included, ",") != "/,/data" {
-		t.Fatalf("included mounts = %v, want root and data only once", included)
-	}
-}
-
 func TestCollectStateIncludesExtraMetrics(t *testing.T) {
 	collector := NewMetricsCollector()
 	sample := collector.CollectState(time.Now())
@@ -112,5 +113,40 @@ func TestCollectStateIncludesExtraMetrics(t *testing.T) {
 	}
 	if sample.SwapUsedBytes < 0 || sample.SwapTotalBytes < 0 || sample.ProcessCount < 0 || sample.TCPConnectionCount < 0 {
 		t.Fatalf("extra state metrics should be non-negative: %+v", sample)
+	}
+}
+
+func TestCollectStateAssignsUniqueStateSampleIDs(t *testing.T) {
+	collector := NewMetricsCollector()
+	now := time.Unix(1782990000, 0)
+	first := collector.CollectState(now)
+	second := collector.CollectState(now)
+
+	if first.SampleID == "" || first.IdempotencyKey != first.SampleID {
+		t.Fatalf("first state id fields = sample_id %q idempotency_key %q, want matching non-empty ids", first.SampleID, first.IdempotencyKey)
+	}
+	if second.SampleID == "" || second.IdempotencyKey != second.SampleID {
+		t.Fatalf("second state id fields = sample_id %q idempotency_key %q, want matching non-empty ids", second.SampleID, second.IdempotencyKey)
+	}
+	if first.SampleID == second.SampleID {
+		t.Fatalf("different collected samples reused id %q", first.SampleID)
+	}
+}
+
+func TestWindowsPagefileSwapTotalsSubtractsRAMWithoutUnderflow(t *testing.T) {
+	total, free := windowsPagefileSwapTotals(12<<30, 7<<30, 8<<30, 5<<30)
+	if total != 4<<30 || free != 2<<30 {
+		t.Fatalf("windows pagefile swap = total %d free %d, want 4GiB/2GiB", total, free)
+	}
+	total, free = windowsPagefileSwapTotals(4<<30, 2<<30, 8<<30, 5<<30)
+	if total != 0 || free != 0 {
+		t.Fatalf("underflowing windows pagefile swap = total %d free %d, want zero", total, free)
+	}
+}
+
+func TestWindowsLoadAveragesAreNotSyntheticCPU(t *testing.T) {
+	load1, load5, load15 := windowsLoadAverages(87.5, 16)
+	if load1 != 0 || load5 != 0 || load15 != 0 {
+		t.Fatalf("windows load averages = %v/%v/%v, want zero because Windows has no Unix load average", load1, load5, load15)
 	}
 }

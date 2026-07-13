@@ -11,9 +11,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +40,15 @@ const (
 	maxProbeSamplesPerRun     = 1024
 	maxProbeTargetBudgetMS    = 60_000
 	maxProbeNodeBudgetMS      = 120_000
+	probeUploadTimeout        = 30 * time.Second
+	maxHTTPProbeRedirects     = 5
+)
+
+var (
+	errInvalidProbeTarget  = errors.New("invalid probe target")
+	errUnsafeProbeTarget   = errors.New("unsafe probe target")
+	errUnsafeProbeRedirect = errors.New("unsafe probe redirect")
+	errProbeDNS            = errors.New("probe dns error")
 )
 
 // SanitizeProbeTargets enforces the Agent-side copy of the Controller probe
@@ -56,7 +67,7 @@ func SanitizeProbeTargets(targets []ProbeTarget) []ProbeTarget {
 		target.Count = normalizedProbeCount(target.Count)
 		target.TimeoutMS = normalizedProbeTimeoutMS(target.TimeoutMS)
 		target.IntervalSec = normalizedProbeIntervalSec(target.IntervalSec)
-		if maxCount := maxProbeTargetBudgetMS / target.TimeoutMS; target.Count > maxCount {
+		if maxCount := maxProbeTargetBudgetMS / probeSampleBudgetMS(target); target.Count > maxCount {
 			target.Count = maxCount
 		}
 		sanitized = append(sanitized, target)
@@ -77,13 +88,14 @@ func LimitProbeTargetsForRun(targets []ProbeTarget) []ProbeTarget {
 	remainingSamples := maxProbeSamplesPerRun
 	remainingBudgetMS := maxProbeNodeBudgetMS
 	for _, target := range sanitized {
-		if remainingSamples <= 0 || remainingBudgetMS < target.TimeoutMS {
+		sampleBudgetMS := probeSampleBudgetMS(target)
+		if remainingSamples <= 0 || remainingBudgetMS < sampleBudgetMS {
 			break
 		}
 		if target.Count > remainingSamples {
 			target.Count = remainingSamples
 		}
-		if maxCount := remainingBudgetMS / target.TimeoutMS; target.Count > maxCount {
+		if maxCount := remainingBudgetMS / sampleBudgetMS; target.Count > maxCount {
 			target.Count = maxCount
 		}
 		if target.Count <= 0 {
@@ -91,9 +103,28 @@ func LimitProbeTargetsForRun(targets []ProbeTarget) []ProbeTarget {
 		}
 		limited = append(limited, target)
 		remainingSamples -= target.Count
-		remainingBudgetMS -= target.Count * target.TimeoutMS
+		remainingBudgetMS -= target.Count * sampleBudgetMS
 	}
 	return limited
+}
+
+func ProbeRunTimeout(targets []ProbeTarget) time.Duration {
+	targets = LimitProbeTargetsForRun(targets)
+	if len(targets) == 0 {
+		return 0
+	}
+	var totalMS int
+	for _, target := range targets {
+		totalMS += normalizedProbeCount(target.Count) * probeSampleBudgetMS(target)
+	}
+	if totalMS <= 0 {
+		return drawableLatencyCap
+	}
+	return time.Duration(totalMS)*time.Millisecond + time.Second
+}
+
+func ProbeUploadTimeout() time.Duration {
+	return probeUploadTimeout
 }
 
 func RunTCPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
@@ -103,21 +134,31 @@ func RunTCPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 	if target.Port == nil {
 		return failedProbeSamples(count, "missing_port")
 	}
+	if !validProbePort(*target.Port) {
+		return failedProbeSamples(count, "invalid_port")
+	}
+	addresses, err := resolveSafeProbeHost(ctx, target.Address, true)
+	if err != nil {
+		return failedProbeSamples(count, classifyProbeSetupError(err))
+	}
 
-	address := net.JoinHostPort(target.Address, strconv.Itoa(*target.Port))
 	samples := make([]ProbeSample, 0, count)
 	for seq := 1; seq <= count; seq++ {
 		select {
 		case <-ctx.Done():
+			label := classifyContextError(ctx.Err())
+			if label == "" {
+				label = "cancelled"
+			}
 			for failedSeq := seq; failedSeq <= count; failedSeq++ {
-				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: "cancelled"})
+				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: label})
 			}
 			return samples
 		default:
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, observationTimeout)
 		start := time.Now()
-		conn, err := (&net.Dialer{Timeout: observationTimeout}).DialContext(dialCtx, "tcp", address)
+		conn, err := dialResolvedProbeAddress(dialCtx, "tcp", addresses, *target.Port, observationTimeout)
 		elapsedMS := float64(time.Since(start).Microseconds()) / 1000
 		cancel()
 		if err != nil {
@@ -140,13 +181,22 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 	if address == "" || strings.HasPrefix(address, "-") {
 		return failedProbeSamples(count, "invalid_address")
 	}
+	addresses, err := resolveSafeProbeHost(ctx, address, true)
+	if err != nil {
+		return failedProbeSamples(count, classifyProbeSetupError(err))
+	}
+	pingAddress := addresses[0].String()
 
 	samples := make([]ProbeSample, 0, count)
 	for seq := 1; seq <= count; seq++ {
 		select {
 		case <-ctx.Done():
+			label := classifyContextError(ctx.Err())
+			if label == "" {
+				label = "cancelled"
+			}
 			for failedSeq := seq; failedSeq <= count; failedSeq++ {
-				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: "cancelled"})
+				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: label})
 			}
 			return samples
 		default:
@@ -154,7 +204,8 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 
 		attemptCtx, cancel := context.WithTimeout(ctx, observationTimeout+time.Second)
 		start := time.Now()
-		cmd := exec.CommandContext(attemptCtx, "ping", "-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutSeconds(observationTimeout)), address)
+		command, args := pingCommand(runtime.GOOS, pingAddress, observationTimeout)
+		cmd := exec.CommandContext(attemptCtx, command, args...)
 		output, err := cmd.CombinedOutput()
 		elapsedMS := float64(time.Since(start).Microseconds()) / 1000
 		ctxErr := attemptCtx.Err()
@@ -177,24 +228,30 @@ func RunHTTPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 	timeout := normalizedProbeTimeout(target.TimeoutMS)
 	observationTimeout := latencyObservationTimeout(timeout)
 	address := strings.TrimSpace(target.Address)
-	if !validHTTPProbeURL(address) {
+	parsedURL, err := parseHTTPProbeURL(address)
+	if err != nil {
 		return failedProbeSamples(count, "invalid_url")
 	}
+	client := newHTTPProbeClient(observationTimeout)
+	defer client.CloseIdleConnections()
 
-	client := &http.Client{Timeout: observationTimeout}
 	samples := make([]ProbeSample, 0, count)
 	for seq := 1; seq <= count; seq++ {
 		select {
 		case <-ctx.Done():
+			label := classifyContextError(ctx.Err())
+			if label == "" {
+				label = "cancelled"
+			}
 			for failedSeq := seq; failedSeq <= count; failedSeq++ {
-				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: "cancelled"})
+				samples = append(samples, ProbeSample{Seq: failedSeq, Success: false, Error: label})
 			}
 			return samples
 		default:
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, observationTimeout)
-		request, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, address, nil)
+		request, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, parsedURL.String(), nil)
 		if err != nil {
 			cancel()
 			samples = append(samples, ProbeSample{Seq: seq, Success: false, Error: "invalid_url"})
@@ -269,6 +326,10 @@ func latencyObservationTimeout(timeout time.Duration) time.Duration {
 	return drawableLatencyCap
 }
 
+func probeSampleBudgetMS(target ProbeTarget) int {
+	return int(latencyObservationTimeout(normalizedProbeTimeout(target.TimeoutMS)) / time.Millisecond)
+}
+
 func measuredProbeSample(seq int, elapsedMS float64, timeout time.Duration) ProbeSample {
 	latency := cappedDrawableLatencyMS(elapsedMS)
 	if time.Duration(elapsedMS*float64(time.Millisecond)) > timeout {
@@ -296,12 +357,252 @@ func cappedDrawableLatencyMS(elapsedMS float64) float64 {
 	return elapsedMS
 }
 
-func validHTTPProbeURL(address string) bool {
+func parseHTTPProbeURL(address string) (*url.URL, error) {
 	parsed, err := url.ParseRequestURI(address)
-	if err != nil || parsed.Host == "" {
-		return false
+	if err != nil || parsed == nil || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil {
+		return nil, errInvalidProbeTarget
 	}
-	return parsed.Scheme == "http" || parsed.Scheme == "https"
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errInvalidProbeTarget
+	}
+	if parsed.Port() != "" {
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil || !validProbePort(port) {
+			return nil, errInvalidProbeTarget
+		}
+	}
+	return parsed, nil
+}
+
+func newHTTPProbeClient(timeout time.Duration) *http.Client {
+	return newHTTPProbeClientWithResolver(timeout, newSafeProbeResolver())
+}
+
+func newHTTPProbeClientWithResolver(timeout time.Duration, resolver *safeProbeResolver) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableKeepAlives = true
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialSafeProbeNetworkAddressWithResolver(ctx, network, address, timeout, resolver)
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxHTTPProbeRedirects {
+				return errUnsafeProbeRedirect
+			}
+			if req.Method != http.MethodGet {
+				return errUnsafeProbeRedirect
+			}
+			if _, err := parseHTTPProbeURL(req.URL.String()); err != nil {
+				return fmt.Errorf("%w: %v", errUnsafeProbeRedirect, err)
+			}
+			if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return errUnsafeProbeRedirect
+			}
+			if _, err := resolver.resolve(req.Context(), req.URL.Hostname(), true); err != nil {
+				if classifyContextError(err) != "" {
+					return err
+				}
+				return fmt.Errorf("%w: %v", errUnsafeProbeRedirect, err)
+			}
+			return nil
+		},
+	}
+}
+
+func dialSafeProbeNetworkAddressWithResolver(ctx context.Context, network, address string, timeout time.Duration, resolver *safeProbeResolver) (net.Conn, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidProbeTarget, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || !validProbePort(port) {
+		return nil, errInvalidProbeTarget
+	}
+	addresses, err := resolver.resolve(ctx, host, true)
+	if err != nil {
+		return nil, err
+	}
+	return dialResolvedProbeAddress(ctx, network, addresses, port, timeout)
+}
+
+func dialResolvedProbeAddress(ctx context.Context, network string, addresses []netip.Addr, port int, timeout time.Duration) (net.Conn, error) {
+	if !validProbePort(port) || len(addresses) == 0 {
+		return nil, errInvalidProbeTarget
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	var lastErr error
+	for _, address := range addresses {
+		if network == "tcp4" && !address.Is4() {
+			continue
+		}
+		if network == "tcp6" && !address.Is6() {
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(address.String(), strconv.Itoa(port)))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errInvalidProbeTarget
+}
+
+type probeIPLookupFunc func(context.Context, string, string) ([]netip.Addr, error)
+
+type safeProbeResolver struct {
+	lookup probeIPLookupFunc
+	mu     sync.Mutex
+	cache  map[string][]netip.Addr
+}
+
+func newSafeProbeResolver() *safeProbeResolver {
+	return newSafeProbeResolverWithLookup(net.DefaultResolver.LookupNetIP)
+}
+
+func newSafeProbeResolverWithLookup(lookup probeIPLookupFunc) *safeProbeResolver {
+	return &safeProbeResolver{lookup: lookup, cache: map[string][]netip.Addr{}}
+}
+
+func (resolver *safeProbeResolver) resolve(ctx context.Context, host string, allowExplicitLoopback bool) ([]netip.Addr, error) {
+	normalizedHost := normalizeProbeHost(host)
+	if normalizedHost == "" || strings.HasPrefix(normalizedHost, "-") {
+		return nil, errInvalidProbeTarget
+	}
+	if _, err := netip.ParseAddr(normalizedHost); err == nil {
+		return resolveSafeProbeHostWithLookup(ctx, normalizedHost, allowExplicitLoopback, resolver.lookup)
+	}
+	cacheKey := strings.ToLower(normalizedHost)
+	resolver.mu.Lock()
+	if cached, ok := resolver.cache[cacheKey]; ok {
+		resolver.mu.Unlock()
+		return cloneProbeAddresses(cached), nil
+	}
+	resolver.mu.Unlock()
+
+	addresses, err := resolveSafeProbeHostWithLookup(ctx, normalizedHost, allowExplicitLoopback, resolver.lookup)
+	if err != nil {
+		return nil, err
+	}
+	addresses = cloneProbeAddresses(addresses)
+	resolver.mu.Lock()
+	if cached, ok := resolver.cache[cacheKey]; ok {
+		resolver.mu.Unlock()
+		return cloneProbeAddresses(cached), nil
+	}
+	resolver.cache[cacheKey] = cloneProbeAddresses(addresses)
+	resolver.mu.Unlock()
+	return addresses, nil
+}
+
+func cloneProbeAddresses(addresses []netip.Addr) []netip.Addr {
+	cloned := make([]netip.Addr, len(addresses))
+	copy(cloned, addresses)
+	return cloned
+}
+
+func normalizeProbeHost(host string) string {
+	return strings.TrimSpace(strings.Trim(host, "[]"))
+}
+
+func resolveSafeProbeHost(ctx context.Context, host string, allowExplicitLoopback bool) ([]netip.Addr, error) {
+	return resolveSafeProbeHostWithLookup(ctx, host, allowExplicitLoopback, net.DefaultResolver.LookupNetIP)
+}
+
+func resolveSafeProbeHostWithLookup(ctx context.Context, host string, allowExplicitLoopback bool, lookup probeIPLookupFunc) ([]netip.Addr, error) {
+	host = normalizeProbeHost(host)
+	if host == "" || strings.HasPrefix(host, "-") {
+		return nil, errInvalidProbeTarget
+	}
+	if address, err := netip.ParseAddr(host); err == nil {
+		address = address.Unmap()
+		if err := validateSafeProbeAddress(address, allowExplicitLoopback); err != nil {
+			return nil, err
+		}
+		return []netip.Addr{address}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	addresses, err := lookup(ctx, "ip", host)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if classifyContextError(err) != "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", errProbeDNS, err)
+	}
+	if len(addresses) == 0 {
+		return nil, errProbeDNS
+	}
+	seen := map[netip.Addr]struct{}{}
+	result := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		address = address.Unmap()
+		if err := validateSafeProbeAddress(address, false); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[address]; ok {
+			continue
+		}
+		seen[address] = struct{}{}
+		result = append(result, address)
+	}
+	return result, nil
+}
+
+func validateSafeProbeAddress(address netip.Addr, allowLoopback bool) error {
+	if !address.IsValid() || address.IsUnspecified() || address.IsMulticast() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() {
+		return errUnsafeProbeTarget
+	}
+	for _, prefix := range alwaysUnsafeProbeAddressPrefixes() {
+		if prefix.Contains(address) {
+			return errUnsafeProbeTarget
+		}
+	}
+	if allowLoopback && address.IsLoopback() {
+		return nil
+	}
+	if address.IsLoopback() {
+		return errUnsafeProbeTarget
+	}
+	return nil
+}
+
+func alwaysUnsafeProbeAddressPrefixes() []netip.Prefix {
+	return []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("169.254.0.0/16"),
+		netip.MustParsePrefix("100.100.100.200/32"),
+		netip.MustParsePrefix("fd00:ec2::254/128"),
+		netip.MustParsePrefix("::/128"),
+		netip.MustParsePrefix("fe80::/10"),
+	}
+}
+
+func validProbePort(port int) bool {
+	return port > 0 && port <= 65535
+}
+
+func classifyProbeSetupError(err error) string {
+	if label := classifyContextError(err); label != "" {
+		return label
+	}
+	switch {
+	case errors.Is(err, errUnsafeProbeTarget):
+		return "unsafe_target"
+	case errors.Is(err, errProbeDNS):
+		return "dns_error"
+	default:
+		return "invalid_address"
+	}
 }
 
 func pingTimeoutSeconds(timeout time.Duration) int {
@@ -310,6 +611,25 @@ func pingTimeoutSeconds(timeout time.Duration) int {
 		return 1
 	}
 	return seconds
+}
+
+func pingTimeoutMilliseconds(timeout time.Duration) int {
+	milliseconds := int((timeout + time.Millisecond - 1) / time.Millisecond)
+	if milliseconds < 1 {
+		return 1
+	}
+	return milliseconds
+}
+
+func pingCommand(goos, address string, timeout time.Duration) (string, []string) {
+	switch goos {
+	case "windows":
+		return "ping", []string{"-n", "1", "-w", strconv.Itoa(pingTimeoutMilliseconds(timeout)), address}
+	case "darwin":
+		return "ping", []string{"-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutMilliseconds(timeout)), address}
+	default:
+		return "ping", []string{"-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutSeconds(timeout)), address}
+	}
 }
 
 func parsePingLatencyMS(output string) (float64, bool) {
@@ -325,8 +645,11 @@ func parsePingLatencyMS(output string) (float64, bool) {
 }
 
 func classifyPingError(err error, output string, ctxErr error) string {
-	if ctxErr != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return "timeout"
+	if label := classifyContextError(ctxErr); label != "" {
+		return label
+	}
+	if label := classifyContextError(err); label != "" {
+		return label
 	}
 	message := strings.ToLower(output + " " + err.Error())
 	if strings.Contains(message, "executable file not found") || strings.Contains(message, "no such file") {
@@ -345,8 +668,23 @@ func classifyPingError(err error, output string, ctxErr error) string {
 }
 
 func classifyHTTPProbeError(err error, ctxErr error) string {
-	if ctxErr != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return "timeout"
+	if label := classifyContextError(ctxErr); label != "" {
+		return label
+	}
+	if label := classifyContextError(err); label != "" {
+		return label
+	}
+	if errors.Is(err, errUnsafeProbeRedirect) {
+		return "unsafe_redirect"
+	}
+	if errors.Is(err, errUnsafeProbeTarget) {
+		return "unsafe_target"
+	}
+	if errors.Is(err, errInvalidProbeTarget) {
+		return "invalid_url"
+	}
+	if errors.Is(err, errProbeDNS) {
+		return "dns_error"
 	}
 	message := strings.ToLower(err.Error())
 	if strings.Contains(message, "no such host") {
@@ -374,8 +712,8 @@ func classifyProbeError(err error) string {
 	if err == nil {
 		return ""
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return "timeout"
+	if label := classifyContextError(err); label != "" {
+		return label
 	}
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return "timeout"
@@ -388,6 +726,19 @@ func classifyProbeError(err error) string {
 		return "dns_error"
 	}
 	return "connect_error"
+}
+
+func classifyContextError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return ""
 }
 
 func ProbeTargets(ctx context.Context, targets []ProbeTarget, ts time.Time) []ProbeRound {

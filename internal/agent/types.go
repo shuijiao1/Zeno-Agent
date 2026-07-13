@@ -27,6 +27,8 @@ type HostInfo struct {
 }
 
 type StateSample struct {
+	SampleID           string  `json:"sample_id,omitempty"`
+	IdempotencyKey     string  `json:"idempotency_key,omitempty"`
 	TS                 int64   `json:"ts"`
 	CPUPercent         float64 `json:"cpu_percent"`
 	Load1              float64 `json:"load1"`

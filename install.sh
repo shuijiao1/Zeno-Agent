@@ -104,6 +104,106 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
 }
 
+is_decimal_octet() {
+  local octet="$1"
+  case "$octet" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#octet}" -le 3 ] || return 1
+  local value=$((10#$octet))
+  [ "$value" -ge 0 ] && [ "$value" -le 255 ]
+}
+
+is_ipv4_loopback() {
+  local value="$1"
+  local a b c d extra
+  IFS=. read -r a b c d extra <<<"$value"
+  [ -z "${extra:-}" ] || return 1
+  is_decimal_octet "$a" && is_decimal_octet "$b" && is_decimal_octet "$c" && is_decimal_octet "$d" || return 1
+  [ "$((10#$a))" -eq 127 ]
+}
+
+is_hex16() {
+  local value="$1"
+  case "$value" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  [ "${#value}" -le 4 ]
+}
+
+is_ipv4_mapped_hex_loopback() {
+  local value="$1"
+  local high low extra
+  IFS=: read -r high low extra <<<"$value"
+  [ -z "${extra:-}" ] || return 1
+  is_hex16 "$high" && is_hex16 "$low" || return 1
+  local high_value=$((16#$high))
+  (( high_value >= 0x7f00 && high_value <= 0x7fff ))
+}
+
+is_ipv4_mapped_loopback() {
+  local value="$1"
+  local suffix=""
+  case "$value" in
+    ::ffff:*) suffix="${value#::ffff:}" ;;
+    0:0:0:0:0:ffff:*) suffix="${value#0:0:0:0:0:ffff:}" ;;
+    0000:0000:0000:0000:0000:ffff:*) suffix="${value#0000:0000:0000:0000:0000:ffff:}" ;;
+    *) return 1 ;;
+  esac
+  is_ipv4_loopback "$suffix" || is_ipv4_mapped_hex_loopback "$suffix"
+}
+
+controller_url_host() {
+  local authority="$1"
+  local host rest
+  if [[ "$authority" == \[* ]]; then
+    rest="${authority#\[}"
+    host="${rest%%]*}"
+    [ "$host" != "$rest" ] || return 1
+    rest="${rest#"$host"}"
+    rest="${rest#]}"
+    case "$rest" in
+      ''|:*) printf '%s' "$host" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  host="${authority%%:*}"
+  [ -n "$host" ] || return 1
+  printf '%s' "$host"
+}
+
+validate_controller_url() {
+  local value="$1"
+  case "$value" in
+    *'?'*|*'#'*) fail "ZENO_CONTROLLER_URL 不能包含查询参数或片段" ;;
+  esac
+  local authority="${value#*://}"
+  authority="${authority%%/*}"
+  [ -n "$authority" ] || fail "ZENO_CONTROLLER_URL 缺少主机"
+  case "$authority" in
+    *@*) fail "ZENO_CONTROLLER_URL 不能包含凭据" ;;
+    :*) fail "ZENO_CONTROLLER_URL 缺少主机" ;;
+  esac
+  case "$value" in
+    https://*) return 0 ;;
+    http://*)
+      local host
+      host=$(controller_url_host "$authority") || fail "ZENO_CONTROLLER_URL 缺少主机"
+      local normalized_host="${host,,}"
+      local localhost_host="${normalized_host%.}"
+      if [ "$localhost_host" = "localhost" ]; then
+        return 0
+      fi
+      if [ "$normalized_host" = "::1" ] || is_ipv4_loopback "$normalized_host" || is_ipv4_mapped_loopback "$normalized_host"; then
+        return 0
+      fi
+      fail "远程 ZENO_CONTROLLER_URL 必须使用 https"
+      ;;
+    *) fail "ZENO_CONTROLLER_URL 必须使用 http 或 https" ;;
+  esac
+}
+
 atomic_install_binary() {
   local source="$1"
   local dest="$2"
@@ -321,13 +421,22 @@ Restart=always
 RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=full
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
 LockPersonality=true
 RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 UMask=0077
 
 [Install]
@@ -396,11 +505,15 @@ ${plist_extra_args}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Umask</key><integer>63</integer>
   <key>StandardOutPath</key><string>/var/log/zeno-agent.log</string>
   <key>StandardErrorPath</key><string>/var/log/zeno-agent.err.log</string>
 </dict>
 </plist>
 EOF_PLIST
+  plutil -lint "$plist_tmp" >/dev/null || fail "LaunchDaemon 配置校验失败，未停止旧服务"
   mv -f "$plist_tmp" "$plist"
   chown root:wheel "$plist"
   chmod 644 "$plist"
@@ -438,6 +551,7 @@ EOF_PLIST
 
 [ -n "$CONTROLLER_URL" ] || fail "必须设置 ZENO_CONTROLLER_URL"
 [ -n "$NODE_ID" ] || fail "必须设置 ZENO_NODE_ID"
+validate_controller_url "$CONTROLLER_URL"
 
 need uname
 need sed
@@ -453,7 +567,10 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$OS" in
   linux) GOOS=linux ;;
-  darwin) GOOS=darwin ;;
+  darwin)
+    GOOS=darwin
+    need plutil
+    ;;
   *) fail "暂不支持系统: $OS" ;;
 esac
 case "$ARCH" in

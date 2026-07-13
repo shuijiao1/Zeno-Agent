@@ -37,5 +37,5 @@ func platformSwapTotals() (total int64, free int64) {
 	}
 	// Windows reports pagefile totals including physical memory. Subtract RAM to
 	// expose a swap/pagefile figure that matches Linux swap semantics in Zeno.
-	return nonNegativeInt64(int64(status.TotalPageFile - status.TotalPhys)), nonNegativeInt64(int64(status.AvailPageFile - status.AvailPhys))
+	return windowsPagefileSwapTotals(status.TotalPageFile, status.AvailPageFile, status.TotalPhys, status.AvailPhys)
 }
