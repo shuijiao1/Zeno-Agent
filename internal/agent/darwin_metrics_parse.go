@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -42,10 +43,20 @@ func parseDarwinLoadAverages(output string) (load1, load5, load15 float64) {
 }
 
 func parseDarwinConnectionCounts(output string) (tcp int64, udp int64) {
+	tcp, udp, _ = parseDarwinConnectionCountsResult(output)
+	return tcp, udp
+}
+
+func parseDarwinConnectionCountsResult(output string) (tcp int64, udp int64, err error) {
 	scanner := bufio.NewScanner(strings.NewReader(output))
+	foundHeader := false
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "Proto" {
+			foundHeader = true
 			continue
 		}
 		protocol := strings.ToLower(fields[0])
@@ -56,14 +67,26 @@ func parseDarwinConnectionCounts(output string) (tcp int64, udp int64) {
 			udp++
 		}
 	}
-	return tcp, udp
+	if err := scanner.Err(); err != nil {
+		return 0, 0, err
+	}
+	if !foundHeader {
+		return 0, 0, fmt.Errorf("darwin netstat connection output is missing its header")
+	}
+	return tcp, udp, nil
 }
 
 func parseDarwinNetworkTotals(output string, allowlist map[string]struct{}) networkTotals {
+	totals, _ := parseDarwinNetworkTotalsResult(output, allowlist)
+	return totals
+}
+
+func parseDarwinNetworkTotalsResult(output string, allowlist map[string]struct{}) (networkTotals, error) {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	indexes := map[string]int{}
 	seen := map[string]struct{}{}
 	var totals networkTotals
+	foundHeader := false
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) == 0 {
@@ -74,6 +97,7 @@ func parseDarwinNetworkTotals(output string, allowlist map[string]struct{}) netw
 			for index, field := range fields {
 				indexes[field] = index
 			}
+			foundHeader = true
 			continue
 		}
 		nameIndex, nameOK := indexes["Name"]
@@ -93,14 +117,22 @@ func parseDarwinNetworkTotals(output string, allowlist map[string]struct{}) netw
 		seen[name] = struct{}{}
 		// Link-layer rows may omit the Address column. The seven counters at
 		// the end are stable, so index Ibytes/Obytes from the right.
-		inBytes, inErr := strconv.ParseInt(fields[len(fields)-5], 10, 64)
-		outBytes, outErr := strconv.ParseInt(fields[len(fields)-2], 10, 64)
-		if inErr == nil && inBytes > 0 {
-			totals.InBytes += inBytes
+		inBytes, inErr := parseNetworkCounter(fields[len(fields)-5])
+		outBytes, outErr := parseNetworkCounter(fields[len(fields)-2])
+		if inErr != nil || outErr != nil {
+			return networkTotals{}, fmt.Errorf("darwin network interface %q has invalid byte counters", name)
 		}
-		if outErr == nil && outBytes > 0 {
-			totals.OutBytes += outBytes
+		if inBytes > maxInt64-totals.InBytes || outBytes > maxInt64-totals.OutBytes {
+			return networkTotals{}, fmt.Errorf("darwin network counter total overflows int64")
 		}
+		totals.InBytes += inBytes
+		totals.OutBytes += outBytes
 	}
-	return totals
+	if err := scanner.Err(); err != nil {
+		return networkTotals{}, err
+	}
+	if !foundHeader {
+		return networkTotals{}, fmt.Errorf("darwin netstat output is missing its header")
+	}
+	return totals, nil
 }

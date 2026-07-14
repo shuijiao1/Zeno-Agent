@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,6 +379,52 @@ func TestRunDueProbesMarksSchedulerCompletionAfterUpload(t *testing.T) {
 	}
 }
 
+func TestRunDueProbesSerializesConcurrentInvocations(t *testing.T) {
+	manager := newProbeTargetManager()
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
+	var uploads atomic.Int64
+	firstUploadStarted := make(chan struct{})
+	releaseFirstUpload := make(chan struct{})
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/probe-results" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		uploads.Add(1)
+		startedOnce.Do(func() { close(firstUploadStarted) })
+		<-releaseFirstUpload
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := agent.NewClient(server.URL, "hytron", "token")
+	errCh := make(chan error, 2)
+	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
+	select {
+	case <-firstUploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first probe upload did not start")
+	}
+	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
+	// Give the second invocation time to contend for the run gate. It must not
+	// obtain the same due batch and start a duplicate upload.
+	time.Sleep(30 * time.Millisecond)
+	if got := uploads.Load(); got != 1 {
+		t.Fatalf("uploads while first run is blocked = %d, want exactly 1", got)
+	}
+	close(releaseFirstUpload)
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("runDueProbes: %v", err)
+		}
+	}
+	if got := uploads.Load(); got != 1 {
+		t.Fatalf("total uploads from concurrent runs = %d, want exactly 1", got)
+	}
+}
+
 func TestProbeConfigPollerRetriesWhenPresenceIsUnavailable(t *testing.T) {
 	oldInterval := probeConfigPollInterval
 	probeConfigPollInterval = 10 * time.Millisecond
@@ -405,5 +453,95 @@ func TestProbeConfigPollerRetriesWhenPresenceIsUnavailable(t *testing.T) {
 	}
 	if attempts.Load() < 2 {
 		t.Fatalf("probe config poll attempts = %d, want retry after failure", attempts.Load())
+	}
+}
+
+func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.T) {
+	oldProbeInterval := probeRunLoopInterval
+	probeRunLoopInterval = 10 * time.Millisecond
+	t.Cleanup(func() { probeRunLoopInterval = oldProbeInterval })
+
+	var heartbeatPosts atomic.Int64
+	var statePosts atomic.Int64
+	probeUploadStarted := make(chan struct{})
+	releaseProbeUpload := make(chan struct{})
+	secondHeartbeat := make(chan struct{})
+	secondState := make(chan struct{})
+	presenceAttempt := make(chan struct{})
+	var probeStartedOnce sync.Once
+	var heartbeatOnce sync.Once
+	var stateOnce sync.Once
+	var presenceOnce sync.Once
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/v1/heartbeat":
+			if heartbeatPosts.Add(1) >= 2 {
+				heartbeatOnce.Do(func() { close(secondHeartbeat) })
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case "/api/agent/v1/state":
+			if statePosts.Add(1) >= 2 {
+				stateOnce.Do(func() { close(secondState) })
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case "/api/agent/v1/host":
+			w.WriteHeader(http.StatusAccepted)
+		case "/api/agent/v1/probe-targets":
+			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 1, Targets: []agent.ProbeTarget{{ID: "slow-upload", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}})
+		case "/api/agent/v1/probe-results":
+			probeStartedOnce.Do(func() { close(probeUploadStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-releaseProbeUpload:
+			}
+		case "/api/agent/v1/presence/ws":
+			presenceOnce.Do(func() { close(presenceAttempt) })
+			http.Error(w, "websocket unavailable in test", http.StatusServiceUnavailable)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	defer close(releaseProbeUpload)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := agent.NewClient(server.URL, "hytron", "token")
+	cfg := config{
+		StateInterval:           10 * time.Millisecond,
+		HeartbeatInterval:       10 * time.Millisecond,
+		HostInterval:            time.Hour,
+		IdentityRefreshInterval: time.Hour,
+		Version:                 "startup-test",
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runAgent(ctx, cfg, client, agent.NewMetricsCollector(), staticIdentityDiscoverer{})
+	}()
+
+	select {
+	case <-probeUploadStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("initial probe upload did not start")
+	}
+	for label, signal := range map[string]<-chan struct{}{"heartbeat": secondHeartbeat, "state": secondState, "presence": presenceAttempt} {
+		select {
+		case <-signal:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatalf("periodic %s did not run while probe upload was blocked", label)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runAgent error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runAgent did not wait for and stop its workers promptly")
 	}
 }

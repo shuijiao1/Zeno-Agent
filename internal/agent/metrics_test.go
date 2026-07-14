@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,6 +38,16 @@ func TestTCPConnectionCountFromFileSkipsHeader(t *testing.T) {
 	}
 }
 
+func TestTCPConnectionCountRejectsMalformedTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tcp")
+	if err := os.WriteFile(path, []byte("not a proc connection table\n"), 0o600); err != nil {
+		t.Fatalf("write malformed tcp fixture: %v", err)
+	}
+	if count, err := tcpConnectionCountFromFileResult(path); err == nil || count != 0 {
+		t.Fatalf("malformed connection table count/error = %d/%v, want explicit error", count, err)
+	}
+}
+
 func TestParseDarwinConnectionCounts(t *testing.T) {
 	tcp, udp := parseDarwinConnectionCounts(`Active Internet connections
 Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
@@ -47,6 +58,12 @@ udp6       0      0  *.5353                 *.*
 `)
 	if tcp != 2 || udp != 2 {
 		t.Fatalf("darwin connection counts = tcp %d udp %d, want 2/2", tcp, udp)
+	}
+}
+
+func TestParseDarwinConnectionCountsRejectsUnknownOutput(t *testing.T) {
+	if tcp, udp, err := parseDarwinConnectionCountsResult("netstat output changed\n"); err == nil || tcp != 0 || udp != 0 {
+		t.Fatalf("unknown Darwin connection output = %d/%d, %v; want explicit error", tcp, udp, err)
 	}
 }
 
@@ -75,6 +92,95 @@ utun1 1380  <Link#9>                         10     0       100       10     0  
 	allowlisted := parseDarwinNetworkTotals(output, allowlistSet([]string{"utun1"}))
 	if allowlisted.InBytes != 100 || allowlisted.OutBytes != 100 {
 		t.Fatalf("allowlisted darwin network totals = %+v, want utun1", allowlisted)
+	}
+}
+
+func TestParseDarwinNetworkTotalsRejectsInvalidSelectedCounter(t *testing.T) {
+	output := `Name  Mtu   Network       Address            Ipkts Ierrs    Ibytes    Opkts Oerrs     Obytes  Coll
+en0   1500  <Link#4>    aa:bb:cc:dd:ee:ff  200     0       bad      300     0       4096     0
+`
+	if _, err := parseDarwinNetworkTotalsResult(output, nil); err == nil {
+		t.Fatal("parseDarwinNetworkTotalsResult accepted an invalid selected counter")
+	}
+}
+
+func TestParseLinuxNetworkTotalsReturnsErrorsInsteadOfZero(t *testing.T) {
+	valid := `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0
+`
+	totals, err := parseLinuxNetworkTotals(valid, nil)
+	if err != nil {
+		t.Fatalf("parseLinuxNetworkTotals(valid): %v", err)
+	}
+	if totals.InBytes != 1000 || totals.OutBytes != 2000 {
+		t.Fatalf("linux network totals = %+v, want 1000/2000", totals)
+	}
+
+	invalid := `Inter-|   Receive | Transmit
+  eth0: not-a-counter 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0
+`
+	if totals, err := parseLinuxNetworkTotals(invalid, nil); err == nil {
+		t.Fatalf("parseLinuxNetworkTotals(invalid) = %+v, nil; want explicit error", totals)
+	}
+	if totals, err := parseLinuxNetworkTotals("eth0: 1 1 0 0 0 0 0 0 2 1 0 0 0 0 0 0\n", nil); err == nil {
+		t.Fatalf("parseLinuxNetworkTotals(missing header) = %+v, nil; want explicit error", totals)
+	}
+}
+
+func TestCollectStateKeepsValidNetworkBaselineAcrossReadFailure(t *testing.T) {
+	collector := NewMetricsCollector()
+	networkReads := 0
+	collector.networkReader = func(map[string]struct{}) (networkTotals, error) {
+		networkReads++
+		switch networkReads {
+		case 1:
+			return networkTotals{InBytes: 1000, OutBytes: 2000}, nil
+		case 2:
+			return networkTotals{}, errors.New("transient counter read failure")
+		case 3:
+			return networkTotals{InBytes: 1100, OutBytes: 2200}, nil
+		default:
+			t.Fatalf("unexpected network read %d", networkReads)
+			return networkTotals{}, nil
+		}
+	}
+	connectionReads := 0
+	collector.connectionReader = func() (int64, int64, error) {
+		connectionReads++
+		if connectionReads == 2 {
+			return 0, 0, errors.New("transient table read failure")
+		}
+		return 12 + int64(connectionReads), 4 + int64(connectionReads), nil
+	}
+
+	start := time.Unix(1782990000, 0)
+	first := collector.CollectState(start)
+	failed := collector.CollectState(start.Add(time.Second))
+	recovered := collector.CollectState(start.Add(2 * time.Second))
+
+	if first.NetTotalsValid == nil || !*first.NetTotalsValid || first.NetInTotalBytes != 1000 || first.NetOutTotalBytes != 2000 {
+		t.Fatalf("first network sample = %+v, want valid 1000/2000 baseline", first)
+	}
+	if failed.NetTotalsValid == nil || *failed.NetTotalsValid {
+		t.Fatalf("failed network sample validity = %v, want false", failed.NetTotalsValid)
+	}
+	if failed.NetInTotalBytes != 1000 || failed.NetOutTotalBytes != 2000 || failed.NetInSpeedBps != 0 || failed.NetOutSpeedBps != 0 {
+		t.Fatalf("failed network sample = %+v, want last-known totals and zero speed", failed)
+	}
+	if recovered.NetTotalsValid == nil || !*recovered.NetTotalsValid {
+		t.Fatalf("recovered network sample validity = %v, want true", recovered.NetTotalsValid)
+	}
+	// The 100/200-byte deltas span two seconds. Advancing the baseline on the
+	// failed middle read would incorrectly report a 100/200 B/s spike here.
+	if recovered.NetInSpeedBps != 50 || recovered.NetOutSpeedBps != 100 {
+		t.Fatalf("recovered speeds = %v/%v, want 50/100 B/s over full 2s interval", recovered.NetInSpeedBps, recovered.NetOutSpeedBps)
+	}
+	if failed.ConnectionCountsValid == nil || *failed.ConnectionCountsValid || failed.TCPConnectionCount != first.TCPConnectionCount || failed.UDPConnectionCount != first.UDPConnectionCount {
+		t.Fatalf("failed connection sample = %+v, want invalid with last-known counts", failed)
+	}
+	if recovered.ConnectionCountsValid == nil || !*recovered.ConnectionCountsValid || recovered.TCPConnectionCount == failed.TCPConnectionCount {
+		t.Fatalf("recovered connection sample = %+v, want refreshed valid counts", recovered)
 	}
 }
 

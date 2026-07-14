@@ -253,3 +253,29 @@ func TestClientDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 		t.Fatalf("redirect target hit count = %d, want 0", leakHits)
 	}
 }
+
+func TestStateValidityFieldsRemainOptionalAndCanRepresentFalse(t *testing.T) {
+	legacyPayload, err := json.Marshal(StateSample{})
+	if err != nil {
+		t.Fatalf("marshal state without validity fields: %v", err)
+	}
+	if strings.Contains(string(legacyPayload), "net_totals_valid") || strings.Contains(string(legacyPayload), "connection_counts_valid") {
+		t.Fatalf("nil optional validity fields were emitted: %s", legacyPayload)
+	}
+
+	invalid := false
+	payload, err := json.Marshal(StateSample{NetTotalsValid: &invalid, ConnectionCountsValid: &invalid})
+	if err != nil {
+		t.Fatalf("marshal invalid state: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode invalid state JSON: %v", err)
+	}
+	if value, ok := decoded["net_totals_valid"]; !ok || value != false {
+		t.Fatalf("net_totals_valid = %v (present=%v), want explicit false", value, ok)
+	}
+	if value, ok := decoded["connection_counts_valid"]; !ok || value != false {
+		t.Fatalf("connection_counts_valid = %v (present=%v), want explicit false", value, ok)
+	}
+}

@@ -21,8 +21,10 @@ const defaultHeartbeatInterval = 15 * time.Second
 const defaultHostInterval = 30 * time.Minute
 const defaultIdentityRefreshInterval = 12 * time.Hour
 const defaultProbeConfigPollInterval = time.Minute
+const probeConfigRefreshTimeout = 20 * time.Second
 
 var probeConfigPollInterval = defaultProbeConfigPollInterval
+var probeRunLoopInterval = time.Second
 
 type config struct {
 	ControllerURL           string
@@ -98,16 +100,23 @@ func run(ctx context.Context, cfg config) error {
 	}
 	client := agent.NewClient(cfg.ControllerURL, cfg.NodeID, cfg.Token)
 	collector := agent.NewMetricsCollector(agent.MetricsOptions{NetworkInterfaceAllowlist: splitCommaList(cfg.NetworkInterfaces), DiskMountAllowlist: splitCommaList(cfg.DiskMounts)})
-	probeManager := newProbeTargetManager()
 	identityDiscoverer := agent.NewCachedNetworkIdentityDiscoverer(agent.NewNetworkIdentityDiscoverer(), cfg.IdentityRefreshInterval)
+	return runAgent(ctx, cfg, client, collector, identityDiscoverer)
+}
+
+func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector, identityDiscoverer networkIdentityDiscoverer) error {
+	normalizeConfigIntervals(&cfg)
+	probeManager := newProbeTargetManager()
 
 	refreshProbeConfig := func(ctx context.Context, requestedVersion int64) (int64, error) {
+		if requestedVersion > 0 {
+			if currentVersion, initialized := probeManager.currentVersion(); initialized && currentVersion >= requestedVersion {
+				return currentVersion, nil
+			}
+		}
 		return refreshProbeTargets(ctx, client, probeManager, requestedVersion)
 	}
 
-	if _, err := refreshProbeConfig(ctx, 0); err != nil {
-		log.Printf("initial probe config fetch failed: %v", err)
-	}
 	if err := reportHeartbeat(ctx, client, cfg.Version); err != nil {
 		log.Printf("initial heartbeat failed: %v", err)
 	}
@@ -117,23 +126,49 @@ func run(ctx context.Context, cfg config) error {
 	if err := reportState(ctx, client, collector); err != nil {
 		log.Printf("initial state report failed: %v", err)
 	}
-	if err := runDueProbes(ctx, client, probeManager); err != nil {
-		log.Printf("initial probe report failed: %v", err)
-	}
 	if cfg.Once {
+		refreshCtx, cancelRefresh := context.WithTimeout(ctx, probeConfigRefreshTimeout)
+		if _, err := refreshProbeConfig(refreshCtx, 0); err != nil {
+			log.Printf("initial probe config fetch failed: %v", err)
+		}
+		cancelRefresh()
+		if err := runDueProbes(ctx, client, probeManager); err != nil {
+			log.Printf("initial probe report failed: %v", err)
+		}
 		return nil
 	}
 
-	go client.RunPresence(ctx, refreshProbeConfig)
-	go runProbeConfigPoller(ctx, refreshProbeConfig)
-	go runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error { return reportState(ctx, client, collector) }, "state report")
-	go runPeriodic(ctx, cfg.HeartbeatInterval, func(ctx context.Context) error { return reportHeartbeat(ctx, client, cfg.Version) }, "heartbeat report")
-	go runPeriodic(ctx, cfg.HostInterval, func(ctx context.Context) error {
-		return reportHost(ctx, client, collector, cfg.Version, identityDiscoverer)
-	}, "host report")
-	go runPeriodicWithTimeout(ctx, time.Second, maxProbeRunLoopTimeout(), func(ctx context.Context) error { return runDueProbes(ctx, client, probeManager) }, "probe report")
+	// Probe setup and execution are intentionally independent from presence,
+	// heartbeat, and state reporting. A worst-case initial probe can consume the
+	// full 120s node budget plus a 30s upload, but it must never postpone those
+	// liveness loops.
+	var workers sync.WaitGroup
+	startWorker := func(runWorker func()) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			runWorker()
+		}()
+	}
+	startWorker(func() { client.RunPresence(ctx, refreshProbeConfig) })
+	startWorker(func() { runProbeConfigPoller(ctx, refreshProbeConfig) })
+	startWorker(func() {
+		runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error { return reportState(ctx, client, collector) }, "state report")
+	})
+	startWorker(func() {
+		runPeriodic(ctx, cfg.HeartbeatInterval, func(ctx context.Context) error { return reportHeartbeat(ctx, client, cfg.Version) }, "heartbeat report")
+	})
+	startWorker(func() {
+		runPeriodic(ctx, cfg.HostInterval, func(ctx context.Context) error {
+			return reportHost(ctx, client, collector, cfg.Version, identityDiscoverer)
+		}, "host report")
+	})
+	startWorker(func() { runProbeLoop(ctx, client, probeManager) })
 
 	<-ctx.Done()
+	// Every worker is context-controlled. Waiting here prevents a service stop
+	// from racing an in-flight websocket write, probe upload, or metrics sample.
+	workers.Wait()
 	return ctx.Err()
 }
 
@@ -172,10 +207,33 @@ func perCallTimeout(interval time.Duration) time.Duration {
 }
 
 func runProbeConfigPoller(ctx context.Context, refreshProbeConfig func(context.Context, int64) (int64, error)) {
+	refreshCtx, cancel := context.WithTimeout(ctx, probeConfigRefreshTimeout)
+	_, err := refreshProbeConfig(refreshCtx, 0)
+	cancel()
+	if err != nil && ctx.Err() == nil {
+		log.Printf("initial probe config refresh failed: %v", err)
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	runPeriodic(ctx, probeConfigPollInterval, func(ctx context.Context) error {
 		_, err := refreshProbeConfig(ctx, 0)
 		return err
 	}, "probe config refresh")
+}
+
+func runProbeLoop(ctx context.Context, client *agent.Client, manager *probeTargetManager) {
+	call := func(ctx context.Context) error { return runDueProbes(ctx, client, manager) }
+	initialCtx, cancel := context.WithTimeout(ctx, maxProbeRunLoopTimeout())
+	err := call(initialCtx)
+	cancel()
+	if err != nil && ctx.Err() == nil {
+		log.Printf("initial probe report failed: %v", err)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	runPeriodicWithTimeout(ctx, probeRunLoopInterval, maxProbeRunLoopTimeout(), call, "probe report")
 }
 
 type networkIdentityDiscoverer interface {
@@ -245,6 +303,8 @@ func reportStateOnly(ctx context.Context, client *agent.Client, collector *agent
 
 type probeTargetManager struct {
 	mu          sync.Mutex
+	refreshGate chan struct{}
+	runGate     chan struct{}
 	targets     []agent.ProbeTarget
 	version     int64
 	initialized bool
@@ -259,7 +319,74 @@ type probeTargetBatch struct {
 }
 
 func newProbeTargetManager() *probeTargetManager {
-	return &probeTargetManager{scheduler: agent.NewProbeScheduler()}
+	manager := &probeTargetManager{
+		scheduler:   agent.NewProbeScheduler(),
+		refreshGate: make(chan struct{}, 1),
+		runGate:     make(chan struct{}, 1),
+	}
+	manager.refreshGate <- struct{}{}
+	manager.runGate <- struct{}{}
+	return manager
+}
+
+func (m *probeTargetManager) currentVersion() (int64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.version, m.initialized
+}
+
+func (m *probeTargetManager) beginRefresh(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("probe target manager is nil")
+	}
+	// Managers are normally created by newProbeTargetManager. Lazily initialize
+	// under the manager mutex for zero-value compatibility.
+	m.mu.Lock()
+	if m.refreshGate == nil {
+		m.refreshGate = make(chan struct{}, 1)
+		m.refreshGate <- struct{}{}
+	}
+	gate := m.refreshGate
+	m.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		return nil
+	}
+}
+
+func (m *probeTargetManager) endRefresh() {
+	m.mu.Lock()
+	gate := m.refreshGate
+	m.mu.Unlock()
+	gate <- struct{}{}
+}
+
+func (m *probeTargetManager) beginRun(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("probe target manager is nil")
+	}
+	m.mu.Lock()
+	if m.runGate == nil {
+		m.runGate = make(chan struct{}, 1)
+		m.runGate <- struct{}{}
+	}
+	gate := m.runGate
+	m.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		return nil
+	}
+}
+
+func (m *probeTargetManager) endRun() {
+	m.mu.Lock()
+	gate := m.runGate
+	m.mu.Unlock()
+	gate <- struct{}{}
 }
 
 func (m *probeTargetManager) update(targets []agent.ProbeTarget, version int64) error {
@@ -318,6 +445,18 @@ func (m *probeTargetManager) markCompleted(batch probeTargetBatch, now time.Time
 }
 
 func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *probeTargetManager, requestedVersion int64) (int64, error) {
+	if requestedVersion < 0 {
+		return 0, fmt.Errorf("invalid requested probe config version %d", requestedVersion)
+	}
+	if err := manager.beginRefresh(ctx); err != nil {
+		return 0, err
+	}
+	defer manager.endRefresh()
+	if requestedVersion > 0 {
+		if currentVersion, initialized := manager.currentVersion(); initialized && currentVersion >= requestedVersion {
+			return currentVersion, nil
+		}
+	}
 	response, err := client.FetchProbeConfig(ctx)
 	if err != nil {
 		return 0, err
@@ -332,6 +471,10 @@ func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *pro
 }
 
 func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTargetManager) error {
+	if err := manager.beginRun(ctx); err != nil {
+		return err
+	}
+	defer manager.endRun()
 	now := time.Now().UTC()
 	batch := manager.due(now)
 	if len(batch.targets) == 0 {

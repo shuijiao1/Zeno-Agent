@@ -23,8 +23,13 @@ jobs:
           check-latest: true
       - run: go mod tidy
       - run: git diff --exit-code -- go.mod go.sum
-      - run: go test ./...
+      - run: go test -race ./...
       - run: go vet ./...
+      - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - run: $(go env GOPATH)/bin/staticcheck ./...
+      - run: bash -n install.sh
+      - shell: pwsh
+        run: '[void][scriptblock]::Create((Get-Content -Raw install.ps1))'
       - name: Build release assets
         run: |
           set -euo pipefail
@@ -41,7 +46,13 @@ jobs:
             fi
             out_dir="dist/zeno-agent_${goos}_${goarch}"
             mkdir -p "$out_dir"
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+            if [ "$goarch" = "arm" ]; then
+              # The single linux_arm asset is consumed by both armv6l and
+              # armv7l installers. GOARM=6 is the compatible contract for both.
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM=6 go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+            else
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+            fi
             if [ "$archive" = "zip" ]; then
               (cd dist && zip -qr "zeno-agent_${goos}_${goarch}.zip" "zeno-agent_${goos}_${goarch}")
             else
@@ -50,9 +61,13 @@ jobs:
           done
           (cd dist && sha256sum zeno-agent_*.tar.gz zeno-agent_*.zip > SHA256SUMS)
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        id: provenance
         if: startsWith(github.ref, 'refs/tags/')
         with:
           subject-checksums: dist/SHA256SUMS
+      - name: Include offline-verifiable provenance bundle
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cp "${{ steps.provenance.outputs.bundle-path }}" dist/zeno-agent_provenance.sigstore.json
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
@@ -60,3 +75,4 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+            dist/zeno-agent_provenance.sigstore.json

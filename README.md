@@ -12,7 +12,7 @@ Controller 本体仓库：<https://github.com/shuijiao1/Zeno>
 
 ## 一键安装
 
-先在 Zeno Admin 后台创建 / 编辑服务器并生成该节点的 Agent token，然后按目标系统复制后台生成的命令执行。
+先在 Zeno Admin 后台创建 / 编辑服务器并生成一次性 Agent 安装命令，然后按目标系统执行。安装器会把命令中的 enrollment token 兑换为随机 runtime token；旧版后台生成的 `ZENO_AGENT_TOKEN` 命令仍兼容。
 
 Linux / macOS：
 
@@ -21,19 +21,21 @@ set -o pipefail
 curl -fsSL https://zeno.shuijiao.de/agent/install.sh | sudo env \
   ZENO_CONTROLLER_URL=https://zeno.example.com \
   ZENO_NODE_ID=<node-id> \
-  ZENO_AGENT_TOKEN=<agent-token> \
+  ZENO_ENROLLMENT_TOKEN=<one-time-enrollment-token> \
   bash
 ```
 
 Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会从 `https://zeno.shuijiao.de/agent/install.ps1` 下载安装脚本，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
 
-安装器会下载 Release 中的 `SHA256SUMS` 并校验 Agent 压缩包；下载失败或校验不一致时会安全停止，不会替换当前可用版本。
+安装器会下载 Release 中的 `SHA256SUMS` 并校验 Agent 压缩包，且默认使用 Release Sigstore bundle（旧 Release 缺少 bundle 时使用 GitHub attestation API）验证构建来源和 workflow identity。下载、哈希或 provenance 验证失败时会在替换当前版本前安全停止。仅在明确接受只做哈希校验的风险时，才可设置 `ZENO_VERIFY_ATTESTATION=false`。
 
 变量说明：
 
 - `ZENO_CONTROLLER_URL`：Controller 公网地址，例如 `https://zeno.shuijiao.li`
 - `ZENO_NODE_ID`：后台服务器 ID
-- `ZENO_AGENT_TOKEN`：该节点 token
+- `ZENO_ENROLLMENT_TOKEN`：后台安装命令中的一次性 enrollment token；安装时兑换为本机 runtime token
+- `ZENO_AGENT_TOKEN`：兼容旧安装命令的直接 runtime token；不能与 `ZENO_ENROLLMENT_TOKEN` 同时设置
+- `ZENO_VERIFY_ATTESTATION`：默认 `true`；设为 `false` 会显式关闭 Release provenance 验证
 - `ZENO_AGENT_VERSION`：默认 `latest`，一般不需要设置
 - `ZENO_AGENT_STATE_INTERVAL`：实时资源 state 上报间隔，默认 `3s`；旧 `ZENO_AGENT_INTERVAL` 仍作为兼容别名
 - `ZENO_AGENT_HEARTBEAT_INTERVAL`：heartbeat 上报间隔，默认 `15s`，用于 last_seen/debug

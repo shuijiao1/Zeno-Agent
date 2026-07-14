@@ -27,27 +27,35 @@ type HostInfo struct {
 }
 
 type StateSample struct {
-	SampleID           string  `json:"sample_id,omitempty"`
-	IdempotencyKey     string  `json:"idempotency_key,omitempty"`
-	TS                 int64   `json:"ts"`
-	CPUPercent         float64 `json:"cpu_percent"`
-	Load1              float64 `json:"load1"`
-	Load5              float64 `json:"load5"`
-	Load15             float64 `json:"load15"`
-	MemoryUsedBytes    int64   `json:"memory_used_bytes"`
-	MemoryTotalBytes   int64   `json:"memory_total_bytes"`
-	SwapUsedBytes      int64   `json:"swap_used_bytes"`
-	SwapTotalBytes     int64   `json:"swap_total_bytes"`
-	DiskUsedBytes      int64   `json:"disk_used_bytes"`
-	DiskTotalBytes     int64   `json:"disk_total_bytes"`
-	NetInTotalBytes    int64   `json:"net_in_total_bytes"`
-	NetOutTotalBytes   int64   `json:"net_out_total_bytes"`
-	NetInSpeedBps      float64 `json:"net_in_speed_bps"`
-	NetOutSpeedBps     float64 `json:"net_out_speed_bps"`
-	ProcessCount       int64   `json:"process_count"`
-	TCPConnectionCount int64   `json:"tcp_connection_count"`
-	UDPConnectionCount int64   `json:"udp_connection_count"`
-	UptimeSeconds      int64   `json:"uptime_seconds"`
+	SampleID         string  `json:"sample_id,omitempty"`
+	IdempotencyKey   string  `json:"idempotency_key,omitempty"`
+	TS               int64   `json:"ts"`
+	CPUPercent       float64 `json:"cpu_percent"`
+	Load1            float64 `json:"load1"`
+	Load5            float64 `json:"load5"`
+	Load15           float64 `json:"load15"`
+	MemoryUsedBytes  int64   `json:"memory_used_bytes"`
+	MemoryTotalBytes int64   `json:"memory_total_bytes"`
+	SwapUsedBytes    int64   `json:"swap_used_bytes"`
+	SwapTotalBytes   int64   `json:"swap_total_bytes"`
+	DiskUsedBytes    int64   `json:"disk_used_bytes"`
+	DiskTotalBytes   int64   `json:"disk_total_bytes"`
+	NetInTotalBytes  int64   `json:"net_in_total_bytes"`
+	NetOutTotalBytes int64   `json:"net_out_total_bytes"`
+	NetInSpeedBps    float64 `json:"net_in_speed_bps"`
+	NetOutSpeedBps   float64 `json:"net_out_speed_bps"`
+	// NetTotalsValid distinguishes a real zero counter from a failed platform
+	// read. It is an optional, additive field so older Controllers can continue
+	// consuming the existing total/speed fields unchanged.
+	NetTotalsValid     *bool `json:"net_totals_valid,omitempty"`
+	ProcessCount       int64 `json:"process_count"`
+	TCPConnectionCount int64 `json:"tcp_connection_count"`
+	UDPConnectionCount int64 `json:"udp_connection_count"`
+	// ConnectionCountsValid has the same compatibility semantics as
+	// NetTotalsValid. On a failed read the numeric fields contain the last known
+	// values (when available), never a fabricated fresh zero.
+	ConnectionCountsValid *bool `json:"connection_counts_valid,omitempty"`
+	UptimeSeconds         int64 `json:"uptime_seconds"`
 }
 
 type ProbeTargetsResponse struct {

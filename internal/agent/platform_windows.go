@@ -22,6 +22,10 @@ const (
 	windowsIfHardwareInterface = 1 << 0
 	windowsIfFilterInterface   = 1 << 1
 	windowsIfEndPointInterface = 1 << 7
+	windowsAFInet              = 2
+	windowsAFInet6             = 23
+	windowsTCPTableBasicAll    = 2
+	windowsUDPTableBasic       = 0
 )
 
 type filetime struct {
@@ -81,33 +85,49 @@ func windowsProcessCount() int64 {
 	return count
 }
 
-func windowsConnectionCounts() (tcp int64, udp int64) {
-	return windowsIPTableCount(getTcpTable2) + windowsIPTableCount(getTcp6Table2),
-		windowsIPTableCount(getUdpTable) + windowsIPTableCount(getUdp6Table)
+func windowsConnectionCounts() (tcp int64, udp int64, err error) {
+	tcp4, err := windowsIPTableCount(getExtendedTcpTable, windowsAFInet, windowsTCPTableBasicAll)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetExtendedTcpTable(AF_INET): %w", err)
+	}
+	tcp6, err := windowsIPTableCount(getExtendedTcpTable, windowsAFInet6, windowsTCPTableBasicAll)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetExtendedTcpTable(AF_INET6): %w", err)
+	}
+	udp4, err := windowsIPTableCount(getExtendedUdpTable, windowsAFInet, windowsUDPTableBasic)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetExtendedUdpTable(AF_INET): %w", err)
+	}
+	udp6, err := windowsIPTableCount(getExtendedUdpTable, windowsAFInet6, windowsUDPTableBasic)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetExtendedUdpTable(AF_INET6): %w", err)
+	}
+	return tcp4 + tcp6, udp4 + udp6, nil
 }
 
-func windowsIPTableCount(proc *syscall.LazyProc) int64 {
+func windowsIPTableCount(proc *syscall.LazyProc, addressFamily, tableClass uintptr) (int64, error) {
 	if err := proc.Find(); err != nil {
-		return 0
+		return 0, err
 	}
-	var size uint32
-	result, _, _ := proc.Call(0, uintptr(unsafe.Pointer(&size)), 0)
-	if result != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) || size < 4 {
-		return 0
-	}
-	buffer := make([]byte, size)
-	result, _, _ = proc.Call(uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0)
-	if result != 0 || size < 4 {
-		return 0
-	}
-	return int64(*(*uint32)(unsafe.Pointer(&buffer[0])))
+	return windowsIPTableCountWithQuery(func(buffer []byte, size *uint32) uint32 {
+		var pointer uintptr
+		if len(buffer) > 0 {
+			pointer = uintptr(unsafe.Pointer(&buffer[0]))
+		}
+		result, _, _ := proc.Call(pointer, uintptr(unsafe.Pointer(size)), 0, addressFamily, tableClass, 0)
+		return uint32(result)
+	})
 }
 
-func windowsNetworkTotals(allowlist map[string]struct{}) networkTotals {
+func windowsNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) {
 	var table *mibIfTable2
 	result, _, _ := getIfTable2Ex.Call(uintptr(windows.MibIfEntryNormal), uintptr(unsafe.Pointer(&table)))
 	if result != 0 || table == nil {
-		return windowsNetworkTotalsLegacy(allowlist)
+		totals, legacyErr := windowsNetworkTotalsLegacy(allowlist)
+		if legacyErr != nil {
+			return networkTotals{}, fmt.Errorf("GetIfTable2Ex returned %d; legacy fallback: %w", result, legacyErr)
+		}
+		return totals, nil
 	}
 	defer freeMibTable.Call(uintptr(unsafe.Pointer(table)))
 
@@ -119,36 +139,55 @@ func windowsNetworkTotals(allowlist map[string]struct{}) networkTotals {
 		if !includeWindowsNetworkRow(row, allowlist) {
 			continue
 		}
-		totals.InBytes += int64(row.InOctets)
-		totals.OutBytes += int64(row.OutOctets)
+		if err := addNetworkCounter(&totals.InBytes, row.InOctets); err != nil {
+			return networkTotals{}, err
+		}
+		if err := addNetworkCounter(&totals.OutBytes, row.OutOctets); err != nil {
+			return networkTotals{}, err
+		}
 	}
-	return totals
+	return totals, nil
 }
 
-func windowsNetworkTotalsLegacy(allowlist map[string]struct{}) networkTotals {
+func windowsNetworkTotalsLegacy(allowlist map[string]struct{}) (networkTotals, error) {
 	var size uint32 = 15 * 1024
 	buffer := make([]byte, size)
 	err := windows.GetAdaptersInfo((*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])), &size)
 	if err == windows.ERROR_BUFFER_OVERFLOW {
+		if size == 0 || size > windowsIPTableMaxBufferBytes {
+			return networkTotals{}, fmt.Errorf("GetAdaptersInfo requested invalid buffer size %d", size)
+		}
 		buffer = make([]byte, size)
 		err = windows.GetAdaptersInfo((*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])), &size)
 	}
 	if err != nil {
-		return networkTotals{}
+		return networkTotals{}, err
 	}
 	var totals networkTotals
 	for adapter := (*windows.IpAdapterInfo)(unsafe.Pointer(&buffer[0])); adapter != nil; adapter = adapter.Next {
 		row := windows.MibIfRow{Index: adapter.Index}
 		if err := windows.GetIfEntry(&row); err != nil {
-			continue
+			return networkTotals{}, err
 		}
 		if !includeWindowsLegacyNetworkRow(&row, allowlist) {
 			continue
 		}
-		totals.InBytes += int64(row.InOctets)
-		totals.OutBytes += int64(row.OutOctets)
+		if err := addNetworkCounter(&totals.InBytes, uint64(row.InOctets)); err != nil {
+			return networkTotals{}, err
+		}
+		if err := addNetworkCounter(&totals.OutBytes, uint64(row.OutOctets)); err != nil {
+			return networkTotals{}, err
+		}
 	}
-	return totals
+	return totals, nil
+}
+
+func addNetworkCounter(total *int64, value uint64) error {
+	if value > uint64(maxInt64) || int64(value) > maxInt64-*total {
+		return fmt.Errorf("network counter total overflows int64")
+	}
+	*total += int64(value)
+	return nil
 }
 
 func includeWindowsNetworkRow(row *windows.MibIfRow2, allowlist map[string]struct{}) bool {

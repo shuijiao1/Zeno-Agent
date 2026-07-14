@@ -33,6 +33,39 @@ func TestPingCommandUsesPlatformTimeoutUnits(t *testing.T) {
 	}
 }
 
+func TestPingCommandUsesIPv6UtilityAndPlatformArguments(t *testing.T) {
+	address := netip.MustParseAddr("2001:db8::10")
+	tests := []struct {
+		goos        string
+		wantCommand string
+		wantArgs    []string
+	}{
+		{goos: "linux", wantCommand: "ping6", wantArgs: []string{"-n", "-c", "1", "-W", "5", "2001:db8::10"}},
+		{goos: "darwin", wantCommand: "ping6", wantArgs: []string{"-n", "-c", "1", "2001:db8::10"}},
+		{goos: "windows", wantCommand: "ping", wantArgs: []string{"-6", "-n", "1", "-w", "5000", "2001:db8::10"}},
+	}
+	for _, test := range tests {
+		t.Run(test.goos, func(t *testing.T) {
+			command, args := pingCommandForAddr(test.goos, address, 5*time.Second)
+			if command != test.wantCommand || !reflect.DeepEqual(args, test.wantArgs) {
+				t.Fatalf("IPv6 ping command = %q %q, want %q %q", command, args, test.wantCommand, test.wantArgs)
+			}
+		})
+	}
+}
+
+func TestRotatedProbeAddressesPreservesDualStackAddrValues(t *testing.T) {
+	ipv4 := netip.MustParseAddr("192.0.2.10")
+	ipv6 := netip.MustParseAddr("2001:db8::10")
+	addresses := []netip.Addr{ipv4, ipv6}
+
+	first := rotatedProbeAddresses(addresses, 0)
+	second := rotatedProbeAddresses(addresses, 1)
+	if !reflect.DeepEqual(first, []netip.Addr{ipv4, ipv6}) || !reflect.DeepEqual(second, []netip.Addr{ipv6, ipv4}) {
+		t.Fatalf("rotated dual-stack addresses = %v / %v, want typed v4/v6 values preserved", first, second)
+	}
+}
+
 func TestParsePingLatencyAcceptsWindowsLessThanOneMillisecond(t *testing.T) {
 	latency, ok := parsePingLatencyMS("Reply from 127.0.0.1: bytes=32 time<1ms TTL=128")
 	if !ok || latency != 1 {

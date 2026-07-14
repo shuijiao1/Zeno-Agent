@@ -33,20 +33,20 @@ func darwinProcessCount() int64 {
 	return int64(len(processes))
 }
 
-func darwinConnectionCounts() (tcp int64, udp int64) {
+func darwinConnectionCounts() (tcp int64, udp int64, err error) {
 	output, err := darwinCommandOutput("/usr/sbin/netstat", "-an")
 	if err != nil {
-		return 0, 0
+		return 0, 0, err
 	}
-	return parseDarwinConnectionCounts(output)
+	return parseDarwinConnectionCountsResult(output)
 }
 
-func darwinNetworkTotals(allowlist map[string]struct{}) networkTotals {
+func darwinNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) {
 	output, err := darwinCommandOutput("/usr/sbin/netstat", "-ibn")
 	if err != nil {
-		return networkTotals{}
+		return networkTotals{}, err
 	}
-	return parseDarwinNetworkTotals(output, allowlist)
+	return parseDarwinNetworkTotalsResult(output, allowlist)
 }
 
 func darwinOSRelease() (string, string) {

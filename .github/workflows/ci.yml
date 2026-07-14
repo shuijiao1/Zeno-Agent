@@ -21,9 +21,40 @@ jobs:
       - run: git diff --exit-code -- go.mod go.sum
       - run: go test -race ./...
       - run: go vet ./...
+      - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - run: $(go env GOPATH)/bin/staticcheck ./...
+      - run: bash -n install.sh
       - name: Cross compile supported targets
         run: |
           set -euo pipefail
           for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -trimpath -o /tmp/zeno-agent-build ./cmd/zeno-agent
+            goos=${target%/*}
+            goarch=${target#*/}
+            if [ "$goarch" = "arm" ]; then
+              GOOS="$goos" GOARCH="$goarch" GOARM=6 CGO_ENABLED=0 go build -trimpath -o /tmp/zeno-agent-build ./cmd/zeno-agent
+            else
+              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -o /tmp/zeno-agent-build ./cmd/zeno-agent
+            fi
           done
+
+  platform-test:
+    name: Native platform tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.25.12'
+          check-latest: true
+      # Root-level installer tests invoke bash and are covered by the Linux
+      # job. These packages exercise the native Darwin/Windows Agent paths.
+      - run: go test ./internal/agent ./cmd/zeno-agent
+      - if: runner.os == 'macOS'
+        run: bash -n install.sh
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: '[void][scriptblock]::Create((Get-Content -Raw install.ps1))'

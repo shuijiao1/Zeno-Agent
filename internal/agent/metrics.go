@@ -2,21 +2,30 @@ package agent
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type MetricsCollector struct {
+	mu               sync.Mutex
 	previousCPU      cpuTimes
 	hasCPU           bool
 	previousNet      networkTotals
 	previousNetAt    time.Time
 	hasNet           bool
+	previousTCP      int64
+	previousUDP      int64
+	hasConnections   bool
 	networkAllowlist map[string]struct{}
 	diskAllowlist    []string
+	networkReader    func(map[string]struct{}) (networkTotals, error)
+	connectionReader func() (tcp int64, udp int64, err error)
 }
 
 type MetricsOptions struct {
@@ -32,6 +41,8 @@ func NewMetricsCollector(options ...MetricsOptions) *MetricsCollector {
 	return &MetricsCollector{
 		networkAllowlist: allowlistSet(opts.NetworkInterfaceAllowlist),
 		diskAllowlist:    normalizeAllowlist(opts.DiskMountAllowlist),
+		networkReader:    readNetworkTotals,
+		connectionReader: connectionCounts,
 	}
 }
 
@@ -57,45 +68,75 @@ func (c *MetricsCollector) CollectHost(version string) HostInfo {
 }
 
 func (c *MetricsCollector) CollectState(now time.Time) StateSample {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	cpu := c.cpuPercent()
 	memTotal, memAvailable := readMemoryTotals()
 	swapTotal, swapFree := readSwapTotals()
 	load1, load5, load15 := readLoadAverages(cpu, runtime.NumCPU())
 	diskUsed, diskTotal := diskUsage(c.diskAllowlist)
-	netTotals := readNetworkTotals(c.networkAllowlist)
-	tcpConnections, udpConnections := connectionCounts()
-	var inSpeed, outSpeed float64
-	if c.hasNet {
-		elapsed := now.Sub(c.previousNetAt).Seconds()
-		if elapsed > 0 {
-			inSpeed = float64(nonNegativeInt64(netTotals.InBytes-c.previousNet.InBytes)) / elapsed
-			outSpeed = float64(nonNegativeInt64(netTotals.OutBytes-c.previousNet.OutBytes)) / elapsed
-		}
+	networkReader := c.networkReader
+	if networkReader == nil {
+		networkReader = readNetworkTotals
 	}
-	c.previousNet = netTotals
-	c.previousNetAt = now
-	c.hasNet = true
+	netTotals, netErr := networkReader(c.networkAllowlist)
+	connectionReader := c.connectionReader
+	if connectionReader == nil {
+		connectionReader = connectionCounts
+	}
+	tcpConnections, udpConnections, connectionErr := connectionReader()
+	var inSpeed, outSpeed float64
+	if netErr == nil {
+		if c.hasNet {
+			elapsed := now.Sub(c.previousNetAt).Seconds()
+			if elapsed > 0 {
+				inSpeed = float64(nonNegativeInt64(netTotals.InBytes-c.previousNet.InBytes)) / elapsed
+				outSpeed = float64(nonNegativeInt64(netTotals.OutBytes-c.previousNet.OutBytes)) / elapsed
+			}
+		}
+		c.previousNet = netTotals
+		c.previousNetAt = now
+		c.hasNet = true
+	} else if c.hasNet {
+		// A transient platform read failure is not a zero counter sample. Keep the
+		// last valid values and, critically, do not move previousNetAt: the next
+		// valid rate is calculated over the complete elapsed interval.
+		netTotals = c.previousNet
+	}
+	if connectionErr == nil {
+		c.previousTCP = tcpConnections
+		c.previousUDP = udpConnections
+		c.hasConnections = true
+	} else if c.hasConnections {
+		tcpConnections = c.previousTCP
+		udpConnections = c.previousUDP
+	}
+	netTotalsValid := netErr == nil
+	connectionCountsValid := connectionErr == nil
 
 	sample := StateSample{
-		TS:                 now.UTC().Unix(),
-		CPUPercent:         cpu,
-		Load1:              load1,
-		Load5:              load5,
-		Load15:             load15,
-		MemoryUsedBytes:    nonNegativeInt64(memTotal - memAvailable),
-		MemoryTotalBytes:   memTotal,
-		SwapUsedBytes:      nonNegativeInt64(swapTotal - swapFree),
-		SwapTotalBytes:     swapTotal,
-		DiskUsedBytes:      diskUsed,
-		DiskTotalBytes:     diskTotal,
-		NetInTotalBytes:    netTotals.InBytes,
-		NetOutTotalBytes:   netTotals.OutBytes,
-		NetInSpeedBps:      inSpeed,
-		NetOutSpeedBps:     outSpeed,
-		ProcessCount:       processCount(),
-		TCPConnectionCount: tcpConnections,
-		UDPConnectionCount: udpConnections,
-		UptimeSeconds:      uptimeSeconds(),
+		TS:                    now.UTC().Unix(),
+		CPUPercent:            cpu,
+		Load1:                 load1,
+		Load5:                 load5,
+		Load15:                load15,
+		MemoryUsedBytes:       nonNegativeInt64(memTotal - memAvailable),
+		MemoryTotalBytes:      memTotal,
+		SwapUsedBytes:         nonNegativeInt64(swapTotal - swapFree),
+		SwapTotalBytes:        swapTotal,
+		DiskUsedBytes:         diskUsed,
+		DiskTotalBytes:        diskTotal,
+		NetInTotalBytes:       netTotals.InBytes,
+		NetOutTotalBytes:      netTotals.OutBytes,
+		NetInSpeedBps:         inSpeed,
+		NetOutSpeedBps:        outSpeed,
+		NetTotalsValid:        &netTotalsValid,
+		ProcessCount:          processCount(),
+		TCPConnectionCount:    tcpConnections,
+		UDPConnectionCount:    udpConnections,
+		ConnectionCountsValid: &connectionCountsValid,
+		UptimeSeconds:         uptimeSeconds(),
 	}
 	return withNewStateSampleIdentifiers(sample, now)
 }
@@ -262,27 +303,67 @@ func processCount() int64 {
 	return count
 }
 
-func connectionCounts() (tcp int64, udp int64) {
+func connectionCounts() (tcp int64, udp int64, err error) {
 	if runtime.GOOS == "darwin" {
 		return darwinConnectionCounts()
 	}
 	if runtime.GOOS == "windows" {
 		return windowsConnectionCounts()
 	}
-	return tcpConnectionCountFromFile("/proc/net/tcp") + tcpConnectionCountFromFile("/proc/net/tcp6"),
-		tcpConnectionCountFromFile("/proc/net/udp") + tcpConnectionCountFromFile("/proc/net/udp6")
+	tcp4, err := tcpConnectionCountFromFileResult("/proc/net/tcp")
+	if err != nil {
+		return 0, 0, err
+	}
+	tcp6, err := optionalConnectionCountFromFile("/proc/net/tcp6")
+	if err != nil {
+		return 0, 0, err
+	}
+	udp4, err := tcpConnectionCountFromFileResult("/proc/net/udp")
+	if err != nil {
+		return 0, 0, err
+	}
+	udp6, err := optionalConnectionCountFromFile("/proc/net/udp6")
+	if err != nil {
+		return 0, 0, err
+	}
+	return tcp4 + tcp6, udp4 + udp6, nil
 }
 
 func tcpConnectionCountFromFile(path string) int64 {
+	count, _ := tcpConnectionCountFromFileResult(path)
+	return count
+}
+
+func tcpConnectionCountFromFileResult(path string) (int64, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-	if len(lines) <= 1 {
-		return 0
+	trimmed := strings.TrimSpace(string(content))
+	if trimmed == "" {
+		return 0, fmt.Errorf("connection table %q is empty", path)
 	}
-	return int64(len(lines) - 1)
+	lines := strings.Split(trimmed, "\n")
+	header := strings.Fields(lines[0])
+	remoteHeaderOK := len(header) >= 3 && (header[2] == "rem_address" || header[2] == "remote_address")
+	if len(header) < 3 || header[0] != "sl" || header[1] != "local_address" || !remoteHeaderOK {
+		return 0, fmt.Errorf("connection table %q has an invalid header", path)
+	}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 10 || !strings.HasSuffix(fields[0], ":") {
+			return 0, fmt.Errorf("connection table %q has a malformed row", path)
+		}
+	}
+	return int64(len(lines) - 1), nil
+}
+
+func optionalConnectionCountFromFile(path string) (int64, error) {
+	count, err := tcpConnectionCountFromFileResult(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	return count, err
 }
 
 type networkTotals struct {
@@ -319,7 +400,7 @@ var defaultExcludedInterfacePrefixes = []string{
 	"zt",
 }
 
-func readNetworkTotals(allowlist map[string]struct{}) networkTotals {
+func readNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) {
 	if runtime.GOOS == "windows" {
 		return windowsNetworkTotals(allowlist)
 	}
@@ -328,12 +409,21 @@ func readNetworkTotals(allowlist map[string]struct{}) networkTotals {
 	}
 	content, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
-		return networkTotals{}
+		return networkTotals{}, err
 	}
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	return parseLinuxNetworkTotals(string(content), allowlist)
+}
+
+func parseLinuxNetworkTotals(content string, allowlist map[string]struct{}) (networkTotals, error) {
+	scanner := bufio.NewScanner(strings.NewReader(content))
 	var totals networkTotals
+	foundHeader := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Inter-|") {
+			foundHeader = true
+			continue
+		}
 		if !strings.Contains(line, ":") {
 			continue
 		}
@@ -344,14 +434,40 @@ func readNetworkTotals(allowlist map[string]struct{}) networkTotals {
 		}
 		fields := strings.Fields(rest)
 		if len(fields) < 16 {
-			continue
+			return networkTotals{}, fmt.Errorf("network interface %q has %d counter fields, want at least 16", iface, len(fields))
 		}
-		inBytes, _ := strconv.ParseInt(fields[0], 10, 64)
-		outBytes, _ := strconv.ParseInt(fields[8], 10, 64)
+		inBytes, err := parseNetworkCounter(fields[0])
+		if err != nil {
+			return networkTotals{}, fmt.Errorf("network interface %q receive counter: %w", iface, err)
+		}
+		outBytes, err := parseNetworkCounter(fields[8])
+		if err != nil {
+			return networkTotals{}, fmt.Errorf("network interface %q transmit counter: %w", iface, err)
+		}
+		if inBytes > maxInt64-totals.InBytes || outBytes > maxInt64-totals.OutBytes {
+			return networkTotals{}, fmt.Errorf("network counter total overflows int64")
+		}
 		totals.InBytes += inBytes
 		totals.OutBytes += outBytes
 	}
-	return totals
+	if err := scanner.Err(); err != nil {
+		return networkTotals{}, err
+	}
+	if !foundHeader {
+		return networkTotals{}, fmt.Errorf("linux network table is missing its header")
+	}
+	return totals, nil
+}
+
+func parseNetworkCounter(value string) (int64, error) {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if parsed > uint64(maxInt64) {
+		return 0, fmt.Errorf("counter exceeds int64")
+	}
+	return int64(parsed), nil
 }
 
 func normalizeAllowlist(values []string) []string {

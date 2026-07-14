@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -18,7 +18,7 @@ type PresenceServerMessage struct {
 
 type PresenceClientMessage struct {
 	Type    string `json:"type"`
-	Version int64  `json:"version,omitempty"`
+	Version int64  `json:"version"`
 }
 
 type PresenceConfigHandler func(ctx context.Context, requestedVersion int64) (appliedVersion int64, err error)
@@ -137,6 +137,10 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 		return err
 	}
 	defer conn.Close()
+	stopCloseOnCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCloseOnCancel()
 	conn.SetReadLimit(presenceReadLimit)
 	log.Printf("presence websocket connected")
 	refreshReadDeadline := func() error {
@@ -160,22 +164,6 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 		}
 		return conn.WriteJSON(value)
 	}
-	writeMessage := func(messageType int, payload []byte) error {
-		if err := conn.SetWriteDeadline(time.Now().Add(presenceWriteTimeout)); err != nil {
-			return err
-		}
-		return conn.WriteMessage(messageType, payload)
-	}
-	if handleConfig != nil {
-		refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		appliedVersion, refreshErr := handleConfig(refreshCtx, 0)
-		cancel()
-		if refreshErr != nil {
-			log.Printf("presence startup config refresh failed: %v", refreshErr)
-		} else if appliedVersion > 0 {
-			_ = writeJSON(PresenceClientMessage{Type: "config_applied", Version: appliedVersion})
-		}
-	}
 	for {
 		var message PresenceServerMessage
 		if err := conn.ReadJSON(&message); err != nil {
@@ -186,6 +174,10 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 			if handleConfig == nil {
 				continue
 			}
+			if message.Version < 0 {
+				log.Printf("presence ignored invalid probe config version %d", message.Version)
+				continue
+			}
 			refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			appliedVersion, refreshErr := handleConfig(refreshCtx, message.Version)
 			cancel()
@@ -193,12 +185,15 @@ func (c *Client) runPresenceOnce(ctx context.Context, handleConfig PresenceConfi
 				log.Printf("presence config refresh failed: %v", refreshErr)
 				continue
 			}
-			if appliedVersion == 0 {
+			if appliedVersion < message.Version {
+				log.Printf("presence config refresh applied version %d, older than requested version %d", appliedVersion, message.Version)
 				continue
 			}
-			payload, _ := json.Marshal(PresenceClientMessage{Type: "config_applied", Version: appliedVersion})
-			if err := writeMessage(websocket.TextMessage, payload); err != nil {
-				return err
+			// ACK only a server-requested change and only after the handler confirms
+			// that version (or a newer one) is actually applied. An unsolicited ACK
+			// on websocket startup can incorrectly clear a Controller notification.
+			if err := writeJSON(PresenceClientMessage{Type: "config_applied", Version: appliedVersion}); err != nil {
+				return fmt.Errorf("write presence config ACK for version %d: %w", appliedVersion, err)
 			}
 		}
 	}

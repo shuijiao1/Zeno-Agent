@@ -9,6 +9,11 @@ TOKEN_FILE="${ZENO_AGENT_TOKEN_FILE:-}"
 CONTROLLER_URL="${ZENO_CONTROLLER_URL:-}"
 NODE_ID="${ZENO_NODE_ID:-}"
 TOKEN="${ZENO_AGENT_TOKEN:-}"
+ENROLLMENT_TOKEN="${ZENO_ENROLLMENT_TOKEN:-}"
+VERIFY_ATTESTATION="${ZENO_VERIFY_ATTESTATION:-true}"
+# Do not let either credential remain in the inherited environment of download,
+# package, or service-management subprocesses.
+unset ZENO_AGENT_TOKEN ZENO_ENROLLMENT_TOKEN
 STATE_INTERVAL="${ZENO_AGENT_STATE_INTERVAL:-${ZENO_AGENT_INTERVAL:-3s}}"
 HEARTBEAT_INTERVAL="${ZENO_AGENT_HEARTBEAT_INTERVAL:-15s}"
 HOST_INTERVAL="${ZENO_AGENT_HOST_INTERVAL:-30m}"
@@ -49,6 +54,19 @@ download_file() {
   fi
 }
 
+download_optional_file() {
+  local url="$1"
+  local dest="$2"
+  rm -f "$dest"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --retry-delay 2 "$url" -o "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --tries=3 -O "$dest" "$url"
+  else
+    fail "未找到 curl 或 wget"
+  fi
+}
+
 sha256_file() {
   local file="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -70,6 +88,60 @@ verify_asset_checksum() {
   local actual
   actual=$(sha256_file "$archive")
   [ "$actual" = "$expected" ] || fail "下载完整性校验失败: $asset"
+}
+
+verify_release_provenance() {
+  local asset_path="$1"
+  local bundle_path="$2"
+  if [ "$VERIFY_ATTESTATION" = "false" ]; then
+    echo "警告: 已显式关闭 Agent provenance 验证。" >&2
+    return 0
+  fi
+  [ "$VERIFY_ATTESTATION" = "true" ] || fail "ZENO_VERIFY_ATTESTATION 必须是 true 或 false"
+
+  local gh_version="2.65.0"
+  local verifier_os verifier_arch verifier_ext verifier_sha
+  case "$GOOS/$GOARCH" in
+    linux/amd64) verifier_os="linux"; verifier_arch="amd64"; verifier_ext="tar.gz"; verifier_sha="762569efe785082b7d1feb06995efece1a9cecce16da8503ac6fdbcbea04085b" ;;
+    linux/arm64) verifier_os="linux"; verifier_arch="arm64"; verifier_ext="tar.gz"; verifier_sha="8bcec9f3ee5c7c3700359a75da774c71221064a0ba017537795aa32ac8bbb481" ;;
+    linux/arm) verifier_os="linux"; verifier_arch="armv6"; verifier_ext="tar.gz"; verifier_sha="72b4949ba83a19938b486c9ec58b23c97d6ec1f17f613084c163503dd3bb0b8d" ;;
+    darwin/amd64) verifier_os="macOS"; verifier_arch="amd64"; verifier_ext="zip"; verifier_sha="0d33a2b5263304e9110051e3ec6b710b26f37cb10170031c1a79a81d2d9a871b" ;;
+    darwin/arm64) verifier_os="macOS"; verifier_arch="arm64"; verifier_ext="zip"; verifier_sha="5acb7110fa6f18d2e1a7bea41526bb8532584f4a10067b40217488bf9f3ad9ab" ;;
+    *) fail "当前平台不支持 provenance 验证: $GOOS/$GOARCH" ;;
+  esac
+  local verifier_archive="gh_${gh_version}_${verifier_os}_${verifier_arch}.${verifier_ext}"
+  local verifier_url="https://github.com/cli/cli/releases/download/v${gh_version}/${verifier_archive}"
+  download_file "$verifier_url" "$TMP/$verifier_archive"
+  [ "$(sha256_file "$TMP/$verifier_archive")" = "$verifier_sha" ] || fail "provenance verifier 校验失败"
+  local verifier_dir="$TMP/provenance-verifier"
+  mkdir -p "$verifier_dir"
+  if [ "$verifier_ext" = "zip" ]; then
+    need unzip
+    unzip -q "$TMP/$verifier_archive" -d "$verifier_dir"
+  else
+    tar -xzf "$TMP/$verifier_archive" -C "$verifier_dir"
+  fi
+  local verifier
+  verifier=$(find "$verifier_dir" -type f -path '*/bin/gh' | head -n1)
+  [ -n "$verifier" ] || fail "provenance verifier 缺少可执行文件"
+  chmod 700 "$verifier"
+  local certificate_identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${VERSION}"
+  local verify_args=(
+    attestation verify "$asset_path"
+    --repo "$REPO"
+    --cert-identity "$certificate_identity"
+    --deny-self-hosted-runners
+  )
+  if [ -s "$bundle_path" ]; then
+    if "$verifier" "${verify_args[@]}" --bundle "$bundle_path" >/dev/null; then
+      return 0
+    fi
+    # A release bundle is only a transport for GitHub's signed attestation.
+    # Retrying against GitHub's attestation API preserves fail-closed
+    # verification while allowing recovery from a corrupt bundle mirror.
+    echo "警告: Release provenance bundle 验证失败，改用 GitHub attestation API 重试。" >&2
+  fi
+  "$verifier" "${verify_args[@]}" >/dev/null || fail "Agent provenance 验证失败"
 }
 
 reject_systemd_arg() {
@@ -204,6 +276,47 @@ validate_controller_url() {
   esac
 }
 
+json_escape() {
+  local value="$1"
+  if [[ "$value" =~ [[:cntrl:]] ]]; then
+    fail "enrollment 字段包含非法控制字符"
+  fi
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
+}
+
+generate_runtime_token() {
+  local generated
+  generated=$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#generated}" -eq 64 ] || fail "生成 Agent runtime token 失败"
+  case "$generated" in
+    *[!0-9a-f]*) fail "生成 Agent runtime token 失败" ;;
+  esac
+  printf '%s' "$generated"
+}
+
+exchange_agent_enrollment() {
+  local runtime_token="$1"
+  local endpoint="${CONTROLLER_URL%/}/api/agent/v1/enroll"
+  local node_json enrollment_json runtime_json
+  node_json=$(json_escape "$NODE_ID")
+  enrollment_json=$(json_escape "$ENROLLMENT_TOKEN")
+  runtime_json=$(json_escape "$runtime_token")
+  # Send the credential body on stdin rather than curl's argv. Enrollment is
+  # deliberately not retried: a successful exchange consumes it once; after
+  # an ambiguous network failure the administrator must issue a new command.
+  if ! printf '{"node_id":"%s","enrollment_token":"%s","runtime_token":"%s"}' "$node_json" "$enrollment_json" "$runtime_json" | \
+      curl -fsS --connect-timeout 10 --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        --data-binary @- \
+        -o /dev/null \
+        "$endpoint"; then
+    fail "一次性 enrollment token 兑换失败；请重新生成安装命令"
+  fi
+}
+
 atomic_install_binary() {
   local source="$1"
   local dest="$2"
@@ -269,6 +382,24 @@ stop_linux_service_for_restore() {
   return 1
 }
 
+stop_macos_service_for_restore() {
+  if ! command -v launchctl >/dev/null 2>&1; then
+    return 0
+  fi
+  launchctl bootout system/li.shuijiao.zeno-agent >/dev/null 2>&1 || \
+    launchctl bootout system "$service_config" >/dev/null 2>&1 || true
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    if ! launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  echo "服务 li.shuijiao.zeno-agent 停止超时，拒绝覆盖旧二进制" >&2
+  return 1
+}
+
 restore_file_backup_atomic() {
   local backup="$1"
   local dest="$2"
@@ -300,6 +431,15 @@ reject_symlink_path() {
   local label="$2"
   if [ -L "$path" ]; then
     fail "$label 不能是符号链接: $path"
+  fi
+}
+
+assert_regular_file_or_absent() {
+  local path="$1"
+  local label="$2"
+  reject_symlink_path "$path" "$label"
+  if [ -e "$path" ] && [ ! -f "$path" ]; then
+    fail "$label 必须是普通文件: $path"
   fi
 }
 
@@ -391,11 +531,7 @@ install_linux_service() {
   local unit_backup=""
   service_kind="linux"
   service_config="$unit"
-  if systemctl is-enabled --quiet "$SERVICE_NAME.service" 2>/dev/null; then
-    service_was_enabled=1
-  else
-    service_was_enabled=0
-  fi
+  service_enable_state=$(systemctl is-enabled "$SERVICE_NAME.service" 2>/dev/null || true)
   if systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
     service_was_active=1
   else
@@ -518,39 +654,19 @@ EOF_PLIST
   chown root:wheel "$plist"
   chmod 644 "$plist"
   launchctl bootout system "$plist" >/dev/null 2>&1 || true
-  if ! launchctl bootstrap system "$plist"; then
-    if [ -n "$backup_bin" ]; then
-      restore_binary_backup "$backup_bin" "$BIN" || fail "Zeno Agent 启动失败，旧二进制回滚失败；备份仍保留: $backup_bin"
-    else
-      rm -f "$BIN" 2>/dev/null || true
-    fi
-    if [ -n "$plist_backup" ] && [ -f "$plist_backup" ]; then
-      restore_file_backup_atomic "$plist_backup" "$plist" "LaunchDaemon 配置" || fail "Zeno Agent 启动失败，LaunchDaemon 配置回滚失败；备份仍保留: $plist_backup"
-      chown root:wheel "$plist"
-      chmod 644 "$plist"
-      launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
-    fi
-    fail "Zeno Agent 启动失败，已尝试回滚到旧二进制"
+  if [ "$service_was_enabled" -eq 0 ]; then
+    launchctl enable system/li.shuijiao.zeno-agent >/dev/null
   fi
-  launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
-  launchctl kickstart -k system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+  launchctl bootstrap system "$plist" || fail "Zeno Agent 启动失败，准备回滚到旧二进制"
+  launchctl kickstart -k system/li.shuijiao.zeno-agent >/dev/null
   if ! launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
-    if [ -n "$backup_bin" ]; then
-      restore_binary_backup "$backup_bin" "$BIN" || fail "Zeno Agent 启动状态验证失败，旧二进制回滚失败；备份仍保留: $backup_bin"
-    else
-      rm -f "$BIN" 2>/dev/null || true
-    fi
-    if [ -n "$plist_backup" ] && [ -f "$plist_backup" ]; then
-      restore_file_backup_atomic "$plist_backup" "$plist" "LaunchDaemon 配置" || fail "Zeno Agent 启动状态验证失败，LaunchDaemon 配置回滚失败；备份仍保留: $plist_backup"
-      chown root:wheel "$plist"
-      chmod 644 "$plist"
-    fi
-    fail "Zeno Agent 启动状态验证失败，已尝试回滚到旧二进制"
+    fail "Zeno Agent 启动状态验证失败，准备回滚到旧二进制"
   fi
 }
 
 [ -n "$CONTROLLER_URL" ] || fail "必须设置 ZENO_CONTROLLER_URL"
 [ -n "$NODE_ID" ] || fail "必须设置 ZENO_NODE_ID"
+[ -z "$TOKEN" ] || [ -z "$ENROLLMENT_TOKEN" ] || fail "ZENO_AGENT_TOKEN 与 ZENO_ENROLLMENT_TOKEN 不能同时设置"
 validate_controller_url "$CONTROLLER_URL"
 
 need uname
@@ -562,14 +678,20 @@ need date
 need find
 need grep
 need stat
+need od
+need tr
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$OS" in
-  linux) GOOS=linux ;;
+  linux)
+    GOOS=linux
+    need systemctl
+    ;;
   darwin)
     GOOS=darwin
     need plutil
+    need launchctl
     ;;
   *) fail "暂不支持系统: $OS" ;;
 esac
@@ -584,10 +706,13 @@ if [ "$VERSION" = "latest" ]; then
   VERSION=$(download_stdout "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
   [ -n "$VERSION" ] || fail "无法获取最新版本"
 fi
+[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9][A-Za-z0-9.-]*)?$ ]] || fail "版本标签格式无效: $VERSION"
 
 ASSET="zeno-agent_${GOOS}_${GOARCH}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 SUMS_URL="https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS"
+PROVENANCE_ASSET="zeno-agent_provenance.sigstore.json"
+PROVENANCE_URL="https://github.com/$REPO/releases/download/$VERSION/$PROVENANCE_ASSET"
 TMP=$(mktemp -d)
 install_started=0
 install_committed=0
@@ -599,8 +724,10 @@ service_kind=""
 service_config=""
 service_config_backup=""
 service_config_existed=0
+service_enable_state=""
 service_was_enabled=0
 service_was_active=0
+enrollment_token_installed=0
 
 cleanup() {
   local status=$?
@@ -609,6 +736,15 @@ cleanup() {
   if [ "$status" -ne 0 ] && [ "$install_started" -eq 1 ] && [ "$install_committed" -eq 0 ]; then
     if [ "$service_kind" = "linux" ]; then
       if ! stop_linux_service_for_restore; then
+        cleanup_status=1
+        can_restore_binary=0
+      fi
+      if ! systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1; then
+        echo "清理安装器创建的 systemd enable 链接失败" >&2
+        cleanup_status=1
+      fi
+    elif [ "$service_kind" = "darwin" ]; then
+      if ! stop_macos_service_for_restore; then
         cleanup_status=1
         can_restore_binary=0
       fi
@@ -625,15 +761,17 @@ cleanup() {
     else
       rm -f "$BIN" 2>/dev/null || true
     fi
-    if [ "$had_existing_token" -eq 1 ]; then
-      if ! restore_token_backup; then
-        echo "token 文件恢复失败，备份仍保留: $backup_token" >&2
-        cleanup_status=1
-      fi
-    else
-      if ! rm -f "$TOKEN_FILE" 2>/dev/null; then
-        echo "移除新 token 文件失败: $TOKEN_FILE" >&2
-        cleanup_status=1
+    if [ "$enrollment_token_installed" -eq 0 ]; then
+      if [ "$had_existing_token" -eq 1 ]; then
+        if ! restore_token_backup; then
+          echo "token 文件恢复失败，备份仍保留: $backup_token" >&2
+          cleanup_status=1
+        fi
+      else
+        if ! rm -f "$TOKEN_FILE" 2>/dev/null; then
+          echo "移除新 token 文件失败: $TOKEN_FILE" >&2
+          cleanup_status=1
+        fi
       fi
     fi
     if [ -n "$service_config" ]; then
@@ -661,18 +799,39 @@ cleanup() {
           echo "systemd daemon-reload 失败" >&2
           cleanup_status=1
         fi
-        if systemctl list-unit-files "$SERVICE_NAME.service" >/dev/null 2>&1 || [ "$service_was_enabled" -eq 1 ] || [ "$service_was_active" -eq 1 ]; then
-          if [ "$service_was_enabled" -eq 1 ]; then
-            if ! systemctl enable "$SERVICE_NAME.service" >/dev/null 2>&1; then
-              echo "恢复 systemd enabled 状态失败" >&2
+        if systemctl list-unit-files "$SERVICE_NAME.service" >/dev/null 2>&1 || [ -n "$service_enable_state" ] || [ "$service_was_active" -eq 1 ]; then
+          case "$service_enable_state" in
+            enabled)
+              if ! systemctl enable "$SERVICE_NAME.service" >/dev/null 2>&1; then
+                echo "恢复 systemd enabled 状态失败" >&2
+                cleanup_status=1
+              fi
+              ;;
+            enabled-runtime)
+              if ! systemctl enable --runtime "$SERVICE_NAME.service" >/dev/null 2>&1; then
+                echo "恢复 systemd enabled-runtime 状态失败" >&2
+                cleanup_status=1
+              fi
+              ;;
+            masked)
+              if ! systemctl mask "$SERVICE_NAME.service" >/dev/null 2>&1; then
+                echo "恢复 systemd masked 状态失败" >&2
+                cleanup_status=1
+              fi
+              ;;
+            masked-runtime)
+              if ! systemctl mask --runtime "$SERVICE_NAME.service" >/dev/null 2>&1; then
+                echo "恢复 systemd masked-runtime 状态失败" >&2
+                cleanup_status=1
+              fi
+              ;;
+            ''|disabled|static|indirect|generated|transient|alias|not-found)
+              ;;
+            *)
+              echo "无法精确恢复未知 systemd enable 状态: $service_enable_state" >&2
               cleanup_status=1
-            fi
-          else
-            if ! systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1; then
-              echo "恢复 systemd disabled 状态失败" >&2
-              cleanup_status=1
-            fi
-          fi
+              ;;
+          esac
           if [ "$service_was_active" -eq 1 ]; then
             if ! systemctl restart "$SERVICE_NAME.service" >/dev/null 2>&1; then
               echo "恢复 systemd active 状态失败" >&2
@@ -683,14 +842,17 @@ cleanup() {
           fi
         fi
       elif [ "$service_kind" = "darwin" ]; then
-        launchctl bootout system "$service_config" >/dev/null 2>&1 || true
-        if [ "$service_was_enabled" -eq 1 ]; then
-          launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
-        else
-          launchctl disable system/li.shuijiao.zeno-agent >/dev/null 2>&1 || true
+        if [ "$service_was_enabled" -eq 0 ]; then
+          if ! launchctl disable system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+            echo "恢复 launchd disabled 状态失败" >&2
+            cleanup_status=1
+          fi
         fi
         if [ "$service_was_active" -eq 1 ]; then
-          launchctl bootstrap system "$service_config" >/dev/null 2>&1 || true
+          if ! launchctl bootstrap system "$service_config" >/dev/null 2>&1; then
+            echo "恢复 launchd active 状态失败" >&2
+            cleanup_status=1
+          fi
         fi
       fi
     fi
@@ -707,6 +869,13 @@ echo "下载 Zeno Agent $VERSION ($GOOS/$GOARCH)..."
 download_file "$URL" "$TMP/$ASSET"
 download_file "$SUMS_URL" "$TMP/SHA256SUMS"
 verify_asset_checksum "$ASSET" "$TMP/$ASSET" "$TMP/SHA256SUMS"
+if [ "$VERIFY_ATTESTATION" = "true" ]; then
+  if ! download_optional_file "$PROVENANCE_URL" "$TMP/$PROVENANCE_ASSET"; then
+    rm -f "$TMP/$PROVENANCE_ASSET"
+    echo "警告: Release 未提供 provenance bundle，改用 GitHub attestation API 验证。" >&2
+  fi
+fi
+verify_release_provenance "$TMP/$ASSET" "$TMP/$PROVENANCE_ASSET"
 
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 FOUND=$(find "$TMP" -type f -name 'zeno-agent' | head -n1)
@@ -728,7 +897,7 @@ if [ -z "$TOKEN_FILE" ]; then
   esac
 fi
 reject_symlink_path "$TOKEN_FILE" "token 文件"
-[ -n "$TOKEN" ] || [ -s "$TOKEN_FILE" ] || fail "必须设置 ZENO_AGENT_TOKEN 或提供已有 token 文件"
+[ -n "$TOKEN" ] || [ -n "$ENROLLMENT_TOKEN" ] || [ -s "$TOKEN_FILE" ] || fail "必须设置 ZENO_ENROLLMENT_TOKEN、ZENO_AGENT_TOKEN 或提供已有 token 文件"
 
 extra_args=()
 if [ -n "$NETWORK_INTERFACES" ]; then
@@ -739,6 +908,16 @@ if [ -n "$DISK_MOUNTS" ]; then
 fi
 
 install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
+assert_regular_file_or_absent "$BIN" "Agent 二进制"
+if [ "$GOOS" = "darwin" ]; then
+  assert_regular_file_or_absent "/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist" "LaunchDaemon 配置"
+else
+  assert_regular_file_or_absent "/etc/systemd/system/${SERVICE_NAME}.service" "systemd unit"
+  current_enable_state=$(systemctl is-enabled "$SERVICE_NAME.service" 2>/dev/null || true)
+  case "$current_enable_state" in
+    masked|masked-runtime) fail "服务当前为 $current_enable_state；请先明确解除 mask 后再安装" ;;
+  esac
+fi
 if [ -e "$BIN" ]; then
   had_existing_binary=1
 fi
@@ -751,7 +930,27 @@ if [ -e "$TOKEN_FILE" ]; then
   set_token_owner_mode "$backup_token"
 fi
 install_started=1
-write_token_file
+if [ -n "$ENROLLMENT_TOKEN" ]; then
+  need curl
+  TOKEN=$(generate_runtime_token)
+  # Prove that the runtime token can be persisted before consuming the
+  # one-time enrollment credential. A failed exchange is then rolled back to
+  # the prior token; a successful exchange keeps this new token on any later
+  # installer failure so the restored service can promote it.
+  write_token_file
+  exchange_agent_enrollment "$TOKEN"
+  enrollment_token_installed=1
+  # The new token is the only credential the service may need after its first
+  # authenticated request promotes it. Do not retain the old runtime token as
+  # an installer backup, and do not roll the new file back on later failures.
+  if [ -n "$backup_token" ]; then
+    rm -f "$backup_token"
+    backup_token=""
+  fi
+  ENROLLMENT_TOKEN=""
+else
+  write_token_file
+fi
 atomic_install_binary "$FOUND" "$BIN" backup_bin
 
 if [ "$GOOS" = "darwin" ]; then

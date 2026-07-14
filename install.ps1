@@ -12,6 +12,11 @@ $TokenFile = if ($env:ZENO_AGENT_TOKEN_FILE) { $env:ZENO_AGENT_TOKEN_FILE } else
 $ControllerURL = $env:ZENO_CONTROLLER_URL
 $NodeID = $env:ZENO_NODE_ID
 $Token = $env:ZENO_AGENT_TOKEN
+$EnrollmentToken = $env:ZENO_ENROLLMENT_TOKEN
+$VerifyAttestation = if ($env:ZENO_VERIFY_ATTESTATION) { $env:ZENO_VERIFY_ATTESTATION.ToLowerInvariant() } else { 'true' }
+# Keep credentials out of every subsequently spawned process environment.
+$env:ZENO_AGENT_TOKEN = $null
+$env:ZENO_ENROLLMENT_TOKEN = $null
 $StateInterval = if ($env:ZENO_AGENT_STATE_INTERVAL) { $env:ZENO_AGENT_STATE_INTERVAL } elseif ($env:ZENO_AGENT_INTERVAL) { $env:ZENO_AGENT_INTERVAL } else { '3s' }
 $HeartbeatInterval = if ($env:ZENO_AGENT_HEARTBEAT_INTERVAL) { $env:ZENO_AGENT_HEARTBEAT_INTERVAL } else { '15s' }
 $HostInterval = if ($env:ZENO_AGENT_HOST_INTERVAL) { $env:ZENO_AGENT_HOST_INTERVAL } else { '30m' }
@@ -52,6 +57,34 @@ function Invoke-DownloadJson($Uri) {
   throw $lastError
 }
 
+function New-AgentRuntimeToken() {
+  $bytes = New-Object byte[] 32
+  $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $generator.GetBytes($bytes)
+  } finally {
+    $generator.Dispose()
+  }
+  return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+}
+
+function Invoke-AgentEnrollment($RuntimeToken) {
+  $endpoint = $ControllerURL.TrimEnd('/') + '/api/agent/v1/enroll'
+  $body = @{
+    node_id = $NodeID
+    enrollment_token = $EnrollmentToken
+    runtime_token = $RuntimeToken
+  } | ConvertTo-Json -Compress
+  try {
+    # No automatic retry: enrollment has first-successful-exchange semantics.
+    # Redirects are rejected so the one-time credential cannot be forwarded to
+    # a different origin by a misconfigured controller.
+    Invoke-RestMethod -UseBasicParsing -Method Post -Uri $endpoint -ContentType 'application/json' -Body $body -TimeoutSec 30 -MaximumRedirection 0 | Out-Null
+  } catch {
+    Fail '一次性 enrollment token 兑换失败；请重新生成安装命令'
+  }
+}
+
 function Get-ExpectedSha256($SumsFile, $AssetName) {
   foreach ($line in Get-Content -Path $SumsFile) {
     $trimmed = $line.Trim()
@@ -70,6 +103,44 @@ function Assert-ArchiveChecksum($Archive, $SumsFile, $AssetName) {
   if ($actual -ne $expected) {
     Fail "下载完整性校验失败: $AssetName"
   }
+}
+
+function Assert-ReleaseProvenance($Archive, $Bundle, $TempDir) {
+  if ($VerifyAttestation -eq 'false') {
+    Write-Warning '已显式关闭 Agent provenance 验证。'
+    return
+  }
+  if ($VerifyAttestation -ne 'true') { Fail 'ZENO_VERIFY_ATTESTATION 必须是 true 或 false' }
+  $ghVersion = '2.65.0'
+  if ($GoArch -eq 'amd64') {
+    $verifierSha = '7f0d84ff2dcc2c9e83664c23e619cfe020964584520fcf2f503dda3d298fb6ea'
+  } elseif ($GoArch -eq 'arm64') {
+    $verifierSha = '5050e0e1844cc7192b90411d897677303f7f728b94d6dce0819002a4ef53757b'
+  } else {
+    Fail "当前平台不支持 provenance 验证: windows/$GoArch"
+  }
+  $verifierArchiveName = "gh_${ghVersion}_windows_${GoArch}.zip"
+  $verifierArchive = Join-Path $TempDir $verifierArchiveName
+  $verifierUrl = "https://github.com/cli/cli/releases/download/v$ghVersion/$verifierArchiveName"
+  Invoke-DownloadFile -Uri $verifierUrl -OutFile $verifierArchive
+  $actualVerifierSha = (Get-FileHash -Algorithm SHA256 -Path $verifierArchive).Hash.ToLowerInvariant()
+  if ($actualVerifierSha -ne $verifierSha) { Fail 'provenance verifier 校验失败' }
+  $verifierDir = Join-Path $TempDir 'provenance-verifier'
+  Expand-Archive -Force -Path $verifierArchive -DestinationPath $verifierDir
+  $verifier = Get-ChildItem -Path $verifierDir -Recurse -Filter 'gh.exe' | Where-Object { $_.FullName -match '[\\/]bin[\\/]gh\.exe$' } | Select-Object -First 1
+  if (-not $verifier) { Fail 'provenance verifier 缺少可执行文件' }
+  $certificateIdentity = "https://github.com/$Repo/.github/workflows/release.yml@refs/tags/$Version"
+  $verifyArgs = @('attestation', 'verify', $Archive, '--repo', $Repo, '--cert-identity', $certificateIdentity, '--deny-self-hosted-runners')
+  if ($Bundle -and (Test-Path -LiteralPath $Bundle -PathType Leaf) -and (Get-Item -LiteralPath $Bundle).Length -gt 0) {
+    & $verifier.FullName @verifyArgs --bundle $Bundle *> $null
+    if ($LASTEXITCODE -eq 0) { return }
+    # The bundle is a transport for GitHub's signed attestation. Falling back
+    # to GitHub's attestation API still requires the same digest and workflow
+    # identity, and therefore remains fail closed.
+    Write-Warning 'Release provenance bundle 验证失败，改用 GitHub attestation API 重试。'
+  }
+  & $verifier.FullName @verifyArgs *> $null
+  if ($LASTEXITCODE -ne 0) { Fail 'Agent provenance 验证失败' }
 }
 
 function Convert-ToSidString($IdentityName) {
@@ -252,6 +323,49 @@ function Restore-PreviousBinary($Backup, $Destination, $ServiceName) {
   }
 }
 
+function Assert-RegularFileOrAbsent($Path, $Label) {
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  $item = Get-Item -Force -LiteralPath $Path
+  if (-not ($item -is [IO.FileInfo]) -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    Fail "$Label 必须是非重解析点的普通文件: $Path"
+  }
+}
+
+function Get-ServiceRegistryPolicy($Name) {
+  $path = "Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$Name"
+  $item = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+  $start = [int]$item.Start
+  $delayedProperty = $item.PSObject.Properties['DelayedAutostart']
+  $sidProperty = $item.PSObject.Properties['ServiceSidType']
+  $delayed = if ($delayedProperty) { [int]$delayedProperty.Value } else { 0 }
+  $sidType = if ($sidProperty) { [int]$sidProperty.Value } else { 0 }
+  if ($start -notin @(2, 3, 4)) { Fail "现有服务启动策略不受支持，拒绝修改: Start=$start" }
+  if ($sidType -notin @(0, 1, 3)) { Fail "现有服务 SID 策略不受支持，拒绝修改: ServiceSidType=$sidType" }
+  return [PSCustomObject]@{
+    Start = $start
+    DelayedAutoStart = $delayed
+    SidType = $sidType
+  }
+}
+
+function Convert-ServiceStartPolicyToScValue($Start, $DelayedAutoStart) {
+  switch ([int]$Start) {
+    2 { if ([int]$DelayedAutoStart -ne 0) { return 'delayed-auto' }; return 'auto' }
+    3 { return 'demand' }
+    4 { return 'disabled' }
+    default { throw "unsupported service Start value: $Start" }
+  }
+}
+
+function Convert-ServiceSidTypeToScValue($SidType) {
+  switch ([int]$SidType) {
+    0 { return 'none' }
+    1 { return 'unrestricted' }
+    3 { return 'restricted' }
+    default { throw "unsupported service SID type: $SidType" }
+  }
+}
+
 function Assert-ControllerURL($Value) {
   $parsed = $null
   if (-not [Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$parsed)) {
@@ -272,15 +386,18 @@ function Assert-ControllerURL($Value) {
 
 if (-not $ControllerURL) { Fail '必须设置 ZENO_CONTROLLER_URL' }
 if (-not $NodeID) { Fail '必须设置 ZENO_NODE_ID' }
+if ($Token -and $EnrollmentToken) { Fail 'ZENO_AGENT_TOKEN 与 ZENO_ENROLLMENT_TOKEN 不能同时设置' }
 Assert-ControllerURL $ControllerURL
 $ExistingTokenUsable = (Test-Path -LiteralPath $TokenFile -PathType Leaf) -and ((Get-Item -LiteralPath $TokenFile).Length -gt 0)
-if (-not $Token -and -not $ExistingTokenUsable) { Fail '必须设置 ZENO_AGENT_TOKEN 或提供已有非空 token 文件' }
+if (-not $Token -and -not $EnrollmentToken -and -not $ExistingTokenUsable) { Fail '必须设置 ZENO_ENROLLMENT_TOKEN、ZENO_AGENT_TOKEN 或提供已有非空 token 文件' }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Fail '请使用管理员身份运行 PowerShell'
 }
+Assert-RegularFileOrAbsent -Path $Bin -Label 'Agent 二进制'
+Assert-RegularFileOrAbsent -Path $TokenFile -Label 'token 文件'
 
 $archName = $env:PROCESSOR_ARCHITECTURE
 if ($archName -eq 'AMD64') {
@@ -296,26 +413,33 @@ if ($Version -eq 'latest') {
   $Version = $release.tag_name
   if (-not $Version) { Fail '无法获取最新版本' }
 }
+if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9][A-Za-z0-9.-]*)?$') { Fail "版本标签格式无效: $Version" }
 
 $Asset = "zeno-agent_windows_$GoArch.zip"
 $Url = "https://github.com/$Repo/releases/download/$Version/$Asset"
 $SumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS"
+$ProvenanceAsset = 'zeno-agent_provenance.sigstore.json'
+$ProvenanceUrl = "https://github.com/$Repo/releases/download/$Version/$ProvenanceAsset"
 $Temp = Join-Path ([IO.Path]::GetTempPath()) ("zeno-agent-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $Temp | Out-Null
 $BackupBin = $null
 $OldBinaryPathName = $null
-$OldStartMode = $null
-$OldDelayedAutoStart = $false
+$OldServiceStart = $null
+$OldDelayedAutoStart = 0
+$OldServiceSidType = $null
+$ServiceSidTypeChanged = $false
 $OldServiceWasRunning = $false
 $Existing = $null
 $CreatedService = $false
-$HadExistingBinary = Test-Path $Bin
-$HadExistingToken = Test-Path $TokenFile
+$HadExistingBinary = Test-Path -LiteralPath $Bin -PathType Leaf
+$HadExistingToken = Test-Path -LiteralPath $TokenFile -PathType Leaf
 $BackupToken = $null
 $OldTokenAcl = $null
 $RestoredPreviousBinary = $false
 $RecoveryBackupPath = $null
 $InstallSucceeded = $false
+$EnrollmentExchangeSucceeded = $false
+$EnrollmentTokenInstalled = $false
 try {
   $Archive = Join-Path $Temp $Asset
   $Sums = Join-Path $Temp 'SHA256SUMS'
@@ -323,6 +447,16 @@ try {
   Invoke-DownloadFile -Uri $Url -OutFile $Archive
   Invoke-DownloadFile -Uri $SumsUrl -OutFile $Sums
   Assert-ArchiveChecksum -Archive $Archive -SumsFile $Sums -AssetName $Asset
+  $ProvenanceBundle = Join-Path $Temp $ProvenanceAsset
+  if ($VerifyAttestation -eq 'true') {
+    try {
+      Invoke-DownloadFile -Uri $ProvenanceUrl -OutFile $ProvenanceBundle
+    } catch {
+      Remove-Item -Force -LiteralPath $ProvenanceBundle -ErrorAction SilentlyContinue
+      Write-Warning 'Release 未提供 provenance bundle，改用 GitHub attestation API 验证。'
+    }
+  }
+  Assert-ReleaseProvenance -Archive $Archive -Bundle $ProvenanceBundle -TempDir $Temp
 
   Expand-Archive -Force -Path $Archive -DestinationPath $Temp
   $Found = Get-ChildItem -Path $Temp -Recurse -Filter 'zeno-agent.exe' | Select-Object -First 1
@@ -330,14 +464,17 @@ try {
 
   $Existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   if ($Existing) {
-    $OldServiceWasRunning = $Existing.Status -eq 'Running'
-    $oldService = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
-    if ($oldService) {
-      $OldBinaryPathName = $oldService.PathName
-      $OldStartMode = $oldService.StartMode
-      $OldDelayedAutoStart = [bool]$oldService.DelayedAutoStart
-      $OldServiceWasRunning = $oldService.State -eq 'Running'
+    if ($Existing.Status -notin @('Running', 'Stopped')) {
+      Fail "旧 zeno-agent 服务状态不稳定，拒绝修改: $($Existing.Status)"
     }
+    $OldServiceWasRunning = $Existing.Status -eq 'Running'
+    $oldService = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+    if (-not $oldService -or -not $oldService.PathName) { Fail '无法读取旧 zeno-agent 服务配置，拒绝修改' }
+    $oldPolicy = Get-ServiceRegistryPolicy -Name $ServiceName
+    $OldBinaryPathName = $oldService.PathName
+    $OldServiceStart = $oldPolicy.Start
+    $OldDelayedAutoStart = $oldPolicy.DelayedAutoStart
+    $OldServiceSidType = $oldPolicy.SidType
     if (-not (Stop-ServiceAndWait -Name $ServiceName)) { Fail '旧 zeno-agent 服务停止超时，拒绝覆盖现有二进制' }
   }
 
@@ -345,18 +482,21 @@ try {
   $NewBin = Join-Path (Split-Path -Parent $Bin) ('.' + (Split-Path -Leaf $Bin) + '.new-' + [Guid]::NewGuid().ToString('N'))
   Copy-Item -Force -Path $Found.FullName -Destination $NewBin
   if (Test-Path $Bin) {
-    $BackupBin = "$Bin.bak-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $BackupBin = "$Bin.bak-$(Get-Date -Format 'yyyyMMddHHmmss')-$([Guid]::NewGuid().ToString('N'))"
     [IO.File]::Replace($NewBin, $Bin, $BackupBin, $false)
   } else {
     Move-Item -Force -Path $NewBin -Destination $Bin
   }
 
   if ($HadExistingToken) {
+    $OldTokenAcl = Get-Acl -Path $TokenFile
     $BackupToken = Join-Path (Split-Path -Parent $TokenFile) ('.agent-token.backup-' + (Get-Date -Format 'yyyyMMddHHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
     Copy-Item -Force -Path $TokenFile -Destination $BackupToken
     Set-TokenBootstrapAcl -Path $BackupToken
     Assert-TokenBootstrapAcl -Path $BackupToken
-    $OldTokenAcl = Get-Acl -Path $TokenFile
+  }
+  if ($EnrollmentToken) {
+    $Token = New-AgentRuntimeToken
   }
   if ($Token) {
     $TokenTmp = Join-Path (Split-Path -Parent $TokenFile) ('.agent-token.tmp-' + [Guid]::NewGuid().ToString('N'))
@@ -371,6 +511,15 @@ try {
     } finally {
       Remove-Item -Force -LiteralPath $TokenTmp -ErrorAction SilentlyContinue
     }
+  }
+  if ($EnrollmentToken) {
+    # Persist the generated runtime token before consuming the one-time
+    # enrollment credential. Until the service ACL is installed below, a
+    # later failure safely restores the prior token (which remains active
+    # until the pending runtime token authenticates).
+    Invoke-AgentEnrollment -RuntimeToken $Token
+    $EnrollmentExchangeSucceeded = $true
+    $EnrollmentToken = $null
   }
 
   $Args = @(
@@ -395,16 +544,28 @@ try {
     $CreatedService = $true
   }
   if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
-  & sc.exe sidtype $ServiceName unrestricted | Out-Null
-  if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
-  if (-not $Existing) {
+  if ($CreatedService) {
+    & sc.exe sidtype $ServiceName unrestricted | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
     & sc.exe privs $ServiceName SeChangeNotifyPrivilege | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务权限收敛配置失败' }
+    & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务失败恢复策略配置失败' }
+  } elseif ($OldServiceSidType -eq 0) {
+    # Existing restricted services are already able to use their service SID;
+    # do not weaken that policy. Only SERVICE_SID_TYPE_NONE must be upgraded.
+    & sc.exe sidtype $ServiceName unrestricted | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
+    $ServiceSidTypeChanged = $true
   }
-  & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
+  if ($EnrollmentExchangeSucceeded) {
+    # From this point the restored service can read and authenticate with the
+    # pending runtime token. Never roll its contents back after a later error.
+    $EnrollmentTokenInstalled = $true
+  }
 
   Start-Service -Name $ServiceName
   if (-not (Wait-ServiceRunning -Name $ServiceName)) { Fail 'Zeno Agent 服务未进入 Running 状态' }
@@ -439,32 +600,56 @@ try {
   } elseif (-not $HadExistingBinary -and (Test-Path $Bin)) {
     Remove-Item -Force -Path $Bin -ErrorAction SilentlyContinue
   }
-  if ($HadExistingToken -and $BackupToken -and (Test-Path $BackupToken)) {
-    try {
-      Restore-TokenBackup -Backup $BackupToken -Destination $TokenFile -OldAcl $OldTokenAcl
-    } catch {
-      [Console]::Error.WriteLine("token 文件恢复失败，备份仍保留在: $BackupToken；错误: $_")
+  if (-not $EnrollmentTokenInstalled) {
+    if ($HadExistingToken -and $BackupToken -and (Test-Path $BackupToken)) {
+      try {
+        Restore-TokenBackup -Backup $BackupToken -Destination $TokenFile -OldAcl $OldTokenAcl
+      } catch {
+        [Console]::Error.WriteLine("token 文件恢复失败，备份仍保留在: $BackupToken；错误: $_")
+      }
+    } elseif (-not $HadExistingToken -and (Test-Path $TokenFile)) {
+      Remove-Item -Force -Path $TokenFile -ErrorAction SilentlyContinue
     }
-  } elseif (-not $HadExistingToken -and (Test-Path $TokenFile)) {
-    Remove-Item -Force -Path $TokenFile -ErrorAction SilentlyContinue
+  } elseif ($HadExistingToken -and $OldTokenAcl -and (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
+    # Keep the new token contents, but restore the prior service's ACL policy
+    # before reverting its SCM SID configuration.
+    try {
+      Set-Acl -Path $TokenFile -AclObject $OldTokenAcl -ErrorAction Stop
+    } catch {
+      [Console]::Error.WriteLine("新 runtime token 的旧 ACL 策略恢复失败: $_")
+    }
   }
   if ($OldBinaryPathName -and -not $CreatedService) {
     & sc.exe config $ServiceName binPath= $OldBinaryPathName | Out-Null
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('旧服务 binPath 恢复失败') }
   }
-  if ($OldStartMode -and -not $CreatedService) {
-    $restoreStartMode = switch ($OldStartMode) {
-      'Auto' { if ($OldDelayedAutoStart) { 'delayed-auto' } else { 'auto' } }
-      'Manual' { 'demand' }
-      'Disabled' { 'disabled' }
-      default { $null }
+  if ($ServiceSidTypeChanged -and $null -ne $OldServiceSidType -and -not $CreatedService) {
+    $restoreSidType = Convert-ServiceSidTypeToScValue -SidType $OldServiceSidType
+    & sc.exe sidtype $ServiceName $restoreSidType | Out-Null
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("旧服务 SID 策略恢复失败: $restoreSidType") }
+  }
+  if ($Existing -and -not $CreatedService -and $null -ne $OldServiceStart) {
+    $restoreStartMode = Convert-ServiceStartPolicyToScValue -Start $OldServiceStart -DelayedAutoStart $OldDelayedAutoStart
+    $startModeBeforeStateRestore = if ($OldServiceWasRunning -and $restoreStartMode -eq 'disabled') { 'demand' } else { $restoreStartMode }
+    & sc.exe config $ServiceName start= $startModeBeforeStateRestore | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      [Console]::Error.WriteLine("旧服务启动策略恢复失败: $startModeBeforeStateRestore")
     }
-    if ($restoreStartMode) { & sc.exe config $ServiceName start= $restoreStartMode | Out-Null }
-  }
-  if ($Existing -and -not $CreatedService) {
     if ($OldServiceWasRunning) {
-      Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+      try {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        if (-not (Wait-ServiceRunning -Name $ServiceName)) { throw '服务未进入 Running 状态' }
+      } catch {
+        [Console]::Error.WriteLine("旧服务 active 状态恢复失败: $_")
+      }
     } else {
-      Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue
+      if (-not (Stop-ServiceAndWait -Name $ServiceName)) {
+        [Console]::Error.WriteLine('旧服务 stopped 状态恢复失败')
+      }
+    }
+    if ($startModeBeforeStateRestore -ne $restoreStartMode) {
+      & sc.exe config $ServiceName start= $restoreStartMode | Out-Null
+      if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("旧服务启动策略恢复失败: $restoreStartMode") }
     }
   }
   if ($HadExistingBinary -and -not $RestoredPreviousBinary) {

@@ -185,7 +185,6 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 	if err != nil {
 		return failedProbeSamples(count, classifyProbeSetupError(err))
 	}
-	pingAddress := addresses[0].String()
 
 	samples := make([]ProbeSample, 0, count)
 	for seq := 1; seq <= count; seq++ {
@@ -204,9 +203,21 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 
 		attemptCtx, cancel := context.WithTimeout(ctx, observationTimeout+time.Second)
 		start := time.Now()
-		command, args := pingCommand(runtime.GOOS, pingAddress, observationTimeout)
-		cmd := exec.CommandContext(attemptCtx, command, args...)
-		output, err := cmd.CombinedOutput()
+		// Keep resolved addresses as netip.Addr values until command selection so
+		// an IPv6 result cannot accidentally be sent to the IPv4 ping utility.
+		// Rotate a dual-stack answer between samples and fall through to the other
+		// family when the first utility fails quickly (for example, ping6 missing).
+		orderedAddresses := rotatedProbeAddresses(addresses, seq-1)
+		var output []byte
+		var err error
+		for _, pingAddress := range orderedAddresses {
+			command, args := pingCommandForAddr(runtime.GOOS, pingAddress, observationTimeout)
+			cmd := exec.CommandContext(attemptCtx, command, args...)
+			output, err = cmd.CombinedOutput()
+			if err == nil || attemptCtx.Err() != nil {
+				break
+			}
+		}
 		elapsedMS := float64(time.Since(start).Microseconds()) / 1000
 		ctxErr := attemptCtx.Err()
 		cancel()
@@ -622,14 +633,54 @@ func pingTimeoutMilliseconds(timeout time.Duration) int {
 }
 
 func pingCommand(goos, address string, timeout time.Duration) (string, []string) {
+	if parsed, err := netip.ParseAddr(normalizeProbeHost(address)); err == nil {
+		return pingCommandForAddr(goos, parsed.Unmap(), timeout)
+	}
+	return pingCommandForAddress(goos, address, false, timeout)
+}
+
+func pingCommandForAddr(goos string, address netip.Addr, timeout time.Duration) (string, []string) {
+	addressText := address.String()
+	return pingCommandForAddress(goos, addressText, address.Is6(), timeout)
+}
+
+func pingCommandForAddress(goos, address string, ipv6 bool, timeout time.Duration) (string, []string) {
 	switch goos {
 	case "windows":
-		return "ping", []string{"-n", "1", "-w", strconv.Itoa(pingTimeoutMilliseconds(timeout)), address}
+		args := []string{"-n", "1", "-w", strconv.Itoa(pingTimeoutMilliseconds(timeout))}
+		if ipv6 {
+			args = append([]string{"-6"}, args...)
+		}
+		return "ping", append(args, address)
 	case "darwin":
+		if ipv6 {
+			// Darwin ping6 has no per-reply timeout flag: -W selects a legacy
+			// node-information query, and -X is not supported. The attempt
+			// context above is the hard timeout for this command.
+			return "ping6", []string{"-n", "-c", "1", address}
+		}
 		return "ping", []string{"-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutMilliseconds(timeout)), address}
 	default:
-		return "ping", []string{"-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutSeconds(timeout)), address}
+		command := "ping"
+		if ipv6 {
+			command = "ping6"
+		}
+		return command, []string{"-n", "-c", "1", "-W", strconv.Itoa(pingTimeoutSeconds(timeout)), address}
 	}
+}
+
+func rotatedProbeAddresses(addresses []netip.Addr, offset int) []netip.Addr {
+	if len(addresses) <= 1 {
+		return addresses
+	}
+	start := offset % len(addresses)
+	if start < 0 {
+		start += len(addresses)
+	}
+	rotated := make([]netip.Addr, 0, len(addresses))
+	rotated = append(rotated, addresses[start:]...)
+	rotated = append(rotated, addresses[:start]...)
+	return rotated
 }
 
 func parsePingLatencyMS(output string) (float64, bool) {
