@@ -91,7 +91,7 @@ func windowsConnectionCounts() (tcp int64, udp int64, err error) {
 		return 0, 0, fmt.Errorf("GetExtendedTcpTable(AF_INET): %w", err)
 	}
 	tcp6, err := windowsIPTableCount(getExtendedTcpTable, windowsAFInet6, windowsTCPTableBasicAll)
-	if err != nil {
+	if err != nil && !windowsIPFamilyUnavailable(err) {
 		return 0, 0, fmt.Errorf("GetExtendedTcpTable(AF_INET6): %w", err)
 	}
 	udp4, err := windowsIPTableCount(getExtendedUdpTable, windowsAFInet, windowsUDPTableBasic)
@@ -99,7 +99,7 @@ func windowsConnectionCounts() (tcp int64, udp int64, err error) {
 		return 0, 0, fmt.Errorf("GetExtendedUdpTable(AF_INET): %w", err)
 	}
 	udp6, err := windowsIPTableCount(getExtendedUdpTable, windowsAFInet6, windowsUDPTableBasic)
-	if err != nil {
+	if err != nil && !windowsIPFamilyUnavailable(err) {
 		return 0, 0, fmt.Errorf("GetExtendedUdpTable(AF_INET6): %w", err)
 	}
 	return tcp4 + tcp6, udp4 + udp6, nil

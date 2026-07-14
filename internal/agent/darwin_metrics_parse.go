@@ -12,6 +12,10 @@ func parseDarwinCPUTimes(output string) (cpuTimes, bool) {
 	if len(fields) < 4 {
 		return cpuTimes{}, false
 	}
+	// kern.cp_time is one CPU_STATES vector. Some current macOS hosts expose
+	// only kern.cp_times, which is the same five-value vector repeated once per
+	// logical CPU. Aggregate every vector and sum its idle (index 3) value.
+	perCPU := len(fields) > 5 && len(fields)%5 == 0
 	var total uint64
 	var idle uint64
 	for index, field := range fields {
@@ -20,7 +24,9 @@ func parseDarwinCPUTimes(output string) (cpuTimes, bool) {
 			return cpuTimes{}, false
 		}
 		total += value
-		if index == 3 {
+		if perCPU && index%5 == 3 {
+			idle += value
+		} else if !perCPU && index == 3 {
 			idle = value
 		}
 	}

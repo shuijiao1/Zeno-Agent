@@ -65,3 +65,14 @@ func TestWindowsIPTableCountPropagatesAPIFailure(t *testing.T) {
 		t.Fatalf("API failure count/error = %d/%v, want explicit error", count, err)
 	}
 }
+
+func TestWindowsIPFamilyUnavailableRecognizesOptionalIPv6Errors(t *testing.T) {
+	for _, code := range []uint32{windowsErrorNotSupported, windowsErrorInvalidParameter} {
+		if !windowsIPFamilyUnavailable(windowsIPTableAPIError{Code: code}) {
+			t.Fatalf("error %d should mark optional IP family unavailable", code)
+		}
+	}
+	if windowsIPFamilyUnavailable(windowsIPTableAPIError{Code: 5}) {
+		t.Fatal("access denied must not be treated as an unavailable optional IP family")
+	}
+}

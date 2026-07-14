@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -24,9 +25,24 @@ const maxInt64 = int64(^uint64(0) >> 1)
 
 const (
 	windowsErrorInsufficientBuffer = uint32(122)
+	windowsErrorNotSupported       = uint32(50)
+	windowsErrorInvalidParameter   = uint32(87)
 	windowsIPTableMaxAttempts      = 5
 	windowsIPTableMaxBufferBytes   = uint32(64 << 20)
 )
+
+type windowsIPTableAPIError struct {
+	Code uint32
+}
+
+func (err windowsIPTableAPIError) Error() string {
+	return fmt.Sprintf("windows IP table query returned error %d", err.Code)
+}
+
+func windowsIPFamilyUnavailable(err error) bool {
+	var apiErr windowsIPTableAPIError
+	return errors.As(err, &apiErr) && (apiErr.Code == windowsErrorNotSupported || apiErr.Code == windowsErrorInvalidParameter)
+}
 
 type windowsIPTableQuery func(buffer []byte, size *uint32) uint32
 
@@ -49,7 +65,7 @@ func windowsIPTableCountWithQuery(query windowsIPTableQuery) (int64, error) {
 			return int64(binary.LittleEndian.Uint32(buffer[:4])), nil
 		}
 		if result != windowsErrorInsufficientBuffer {
-			return 0, fmt.Errorf("windows IP table query returned error %d", result)
+			return 0, windowsIPTableAPIError{Code: result}
 		}
 		if size < 4 {
 			return 0, fmt.Errorf("windows IP table query requested invalid buffer size %d", size)

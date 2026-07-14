@@ -10,11 +10,16 @@ import (
 )
 
 func darwinReadCPUTimes() (cpuTimes, bool) {
-	output, err := darwinCommandOutput("/usr/sbin/sysctl", "-n", "kern.cp_time")
-	if err != nil {
-		return cpuTimes{}, false
+	for _, name := range []string{"kern.cp_time", "kern.cp_times"} {
+		output, err := darwinCommandOutput("/usr/sbin/sysctl", "-n", name)
+		if err != nil {
+			continue
+		}
+		if values, ok := parseDarwinCPUTimes(output); ok {
+			return values, true
+		}
 	}
-	return parseDarwinCPUTimes(output)
+	return cpuTimes{}, false
 }
 
 func darwinLoadAverages() (load1, load5, load15 float64) {

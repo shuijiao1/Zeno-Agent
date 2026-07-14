@@ -78,6 +78,13 @@ func TestParseDarwinCPUAndLoadAverages(t *testing.T) {
 	}
 }
 
+func TestParseDarwinPerCPUTimes(t *testing.T) {
+	times, ok := parseDarwinCPUTimes("10 1 4 85 0 20 2 8 170 0")
+	if !ok || times.Total != 300 || times.Idle != 255 {
+		t.Fatalf("per-CPU times = %+v ok=%v, want total=300 idle=255", times, ok)
+	}
+}
+
 func TestParseDarwinNetworkTotalsUsesLinkRowsOnce(t *testing.T) {
 	output := `Name  Mtu   Network       Address            Ipkts Ierrs    Ibytes    Opkts Oerrs     Obytes  Coll
 lo0   16384 <Link#1>                        100     0      1000      100     0       1000     0
