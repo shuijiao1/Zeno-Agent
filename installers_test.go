@@ -118,12 +118,14 @@ func TestUnixControllerURLValidation(t *testing.T) {
 	fragment := extractShellFunction(t, script, "fail") + "\n" +
 		extractShellFunction(t, script, "is_decimal_octet") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_loopback") + "\n" +
+		extractShellFunction(t, script, "is_ipv4_literal") + "\n" +
 		extractShellFunction(t, script, "is_hex16") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_mapped_hex_loopback") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_mapped_loopback") + "\n" +
 		extractShellFunction(t, script, "controller_url_host") + "\n" +
+		extractShellFunction(t, script, "controller_url_has_explicit_port") + "\n" +
 		extractShellFunction(t, script, "validate_controller_url") + "\n"
-	for _, value := range []string{"https://zeno.example.com", "http://localhost:18980", "http://localhost.:18980", "http://127.0.0.1:18980", "http://127.0.0.2:18980", "http://127.255.255.255:18980", "http://[::1]:18980", "http://[::ffff:127.0.0.1]:18980", "http://[::ffff:7f00:1]:18980"} {
+	for _, value := range []string{"https://zeno.example.com", "http://localhost:18980", "http://localhost.:18980", "http://127.0.0.1:18980", "http://127.0.0.2:18980", "http://127.255.255.255:18980", "http://203.0.113.10:18980", "http://[::1]:18980", "http://[::ffff:127.0.0.1]:18980", "http://[::ffff:7f00:1]:18980", "http://[::ffff:192.168.1.1]:18980", "http://[::ffff:8000:1]:18980", "http://[2001:db8::10]:18980"} {
 		cmd := exec.Command("bash", "-c", fragment+"validate_controller_url \"$1\"", "bash", value)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("validate_controller_url rejected %q: %v\n%s", value, err, out)
@@ -136,8 +138,8 @@ func TestUnixControllerURLValidation(t *testing.T) {
 		"http://127.evil.example",
 		"http://127.0.0.1.evil.example",
 		"http://127.0.0.256:18980",
-		"http://[::ffff:192.168.1.1]:18980",
-		"http://[::ffff:8000:1]:18980",
+		"http://203.0.113.10",
+		"http://[2001:db8::10]",
 		"http://[::1]evil:18980",
 		"https://user:pass@zeno.example.com",
 		"https://zeno.example.com?token=secret",
@@ -173,6 +175,9 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"NT SERVICE\\$ServiceName",
 		"[System.Security.AccessControl.FileSystemRights]::Write",
 		"[IO.File]::Replace($Source, $Destination",
+		".agent-token.replace-backup-",
+		"Set-ServiceBinaryPath",
+		"$ServiceBinPathChanged",
 		"Restore-PreviousBinary",
 		"Stop-ServiceAndWait",
 		".agent-token.backup-",
@@ -210,6 +215,9 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 	}
 	if strings.Contains(script, "Move-Item -Force -Path $TokenTmp -Destination $TokenFile") {
 		t.Fatalf("install.ps1 still replaces the token without the atomic helper")
+	}
+	if strings.Contains(script, "$nullBackup") || strings.Contains(script, "[IO.File]::Replace($Source, $Destination, $null") {
+		t.Fatalf("install.ps1 still passes a null backup path to File.Replace")
 	}
 	if !strings.Contains(script, "Set-TokenBootstrapAcl -Path $BackupToken") || !strings.Contains(script, "Assert-TokenBootstrapAcl -Path $BackupToken") {
 		t.Fatalf("install.ps1 does not protect the token rollback backup with the bootstrap ACL")
