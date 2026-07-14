@@ -85,6 +85,13 @@ func TestParseDarwinPerCPUTimes(t *testing.T) {
 	}
 }
 
+func TestParseDarwinCPUTimesAcceptsSysctlBraces(t *testing.T) {
+	times, ok := parseDarwinCPUTimes("{ 100 20 30 400 5 }")
+	if !ok || times.Total != 555 || times.Idle != 400 {
+		t.Fatalf("braced CPU times = %+v ok=%v, want total=555 idle=400", times, ok)
+	}
+}
+
 func TestParseDarwinNetworkTotalsUsesLinkRowsOnce(t *testing.T) {
 	output := `Name  Mtu   Network       Address            Ipkts Ierrs    Ibytes    Opkts Oerrs     Obytes  Coll
 lo0   16384 <Link#1>                        100     0      1000      100     0       1000     0

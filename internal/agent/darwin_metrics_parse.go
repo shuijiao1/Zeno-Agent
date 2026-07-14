@@ -8,7 +8,14 @@ import (
 )
 
 func parseDarwinCPUTimes(output string) (cpuTimes, bool) {
-	fields := strings.Fields(output)
+	rawFields := strings.Fields(output)
+	fields := make([]string, 0, len(rawFields))
+	for _, field := range rawFields {
+		field = strings.Trim(field, "{},")
+		if field != "" {
+			fields = append(fields, field)
+		}
+	}
 	if len(fields) < 4 {
 		return cpuTimes{}, false
 	}
