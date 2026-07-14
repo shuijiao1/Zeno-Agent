@@ -195,6 +195,14 @@ is_ipv4_loopback() {
   [ "$((10#$a))" -eq 127 ]
 }
 
+is_ipv4_literal() {
+  local value="$1"
+  local a b c d extra
+  IFS=. read -r a b c d extra <<<"$value"
+  [ -z "${extra:-}" ] || return 1
+  is_decimal_octet "$a" && is_decimal_octet "$b" && is_decimal_octet "$c" && is_decimal_octet "$d"
+}
+
 is_hex16() {
   local value="$1"
   case "$value" in
@@ -245,6 +253,27 @@ controller_url_host() {
   printf '%s' "$host"
 }
 
+controller_url_has_explicit_port() {
+  local authority="$1"
+  local port
+  if [[ "$authority" == \[* ]]; then
+    local rest="${authority#*]}"
+    case "$rest" in
+      :*) port="${rest#:}" ;;
+      *) return 1 ;;
+    esac
+  else
+    case "$authority" in
+      *:*) port="${authority##*:}" ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
 validate_controller_url() {
   local value="$1"
   case "$value" in
@@ -268,6 +297,9 @@ validate_controller_url() {
         return 0
       fi
       if [ "$normalized_host" = "::1" ] || is_ipv4_loopback "$normalized_host" || is_ipv4_mapped_loopback "$normalized_host"; then
+        return 0
+      fi
+      if controller_url_has_explicit_port "$authority" && { is_ipv4_literal "$normalized_host" || [[ "$normalized_host" == *:* ]]; }; then
         return 0
       fi
       fail "远程 ZENO_CONTROLLER_URL 必须使用 https"

@@ -216,8 +216,15 @@ function Write-StrictTemporaryTokenFile($Path, $TokenValue) {
 
 function Move-TokenIntoPlaceAtomically($Source, $Destination) {
   if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-    $nullBackup = $null
-    [IO.File]::Replace($Source, $Destination, $nullBackup, $false)
+    # Windows PowerShell 5.1/.NET Framework rejects a null backup path in the
+    # four-argument File.Replace overload. Use a real same-directory backup so
+    # replacement remains atomic, then remove the transient backup.
+    $replaceBackup = Join-Path (Split-Path -Parent $Destination) ('.agent-token.replace-backup-' + [Guid]::NewGuid().ToString('N'))
+    try {
+      [IO.File]::Replace($Source, $Destination, $replaceBackup, $false)
+    } finally {
+      Remove-Item -Force -LiteralPath $replaceBackup -ErrorAction SilentlyContinue
+    }
   } else {
     Move-Item -Force -LiteralPath $Source -Destination $Destination
   }
@@ -348,6 +355,13 @@ function Get-ServiceRegistryPolicy($Name) {
   }
 }
 
+function Set-ServiceBinaryPath($Name, $BinaryPathName) {
+  $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+  if (-not $service) { return $false }
+  $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ PathName = $BinaryPathName } -ErrorAction Stop
+  return $result -and ([int]$result.ReturnValue -eq 0)
+}
+
 function Convert-ServiceStartPolicyToScValue($Start, $DelayedAutoStart) {
   switch ([int]$Start) {
     2 { if ([int]$DelayedAutoStart -ne 0) { return 'delayed-auto' }; return 'auto' }
@@ -377,8 +391,10 @@ function Assert-ControllerURL($Value) {
   if ($parsed.Scheme -eq 'https') { return }
   if ($parsed.Scheme -eq 'http') {
     $address = $null
-    $isLoopbackAddress = [Net.IPAddress]::TryParse($parsed.DnsSafeHost, [ref]$address) -and [Net.IPAddress]::IsLoopback($address)
+    $isIPAddress = [Net.IPAddress]::TryParse($parsed.DnsSafeHost, [ref]$address)
+    $isLoopbackAddress = $isIPAddress -and [Net.IPAddress]::IsLoopback($address)
     if ($parsed.DnsSafeHost -eq 'localhost' -or $isLoopbackAddress) { return }
+    if ($isIPAddress -and -not $parsed.IsDefaultPort) { return }
   }
   if ($parsed.Scheme -eq 'http') { Fail '远程 ZENO_CONTROLLER_URL 必须使用 https' }
   Fail 'ZENO_CONTROLLER_URL 必须使用 http 或 https'
@@ -428,6 +444,7 @@ $OldServiceStart = $null
 $OldDelayedAutoStart = 0
 $OldServiceSidType = $null
 $ServiceSidTypeChanged = $false
+$ServiceBinPathChanged = $false
 $OldServiceWasRunning = $false
 $Existing = $null
 $CreatedService = $false
@@ -537,8 +554,10 @@ try {
   $BinPath = Join-WindowsCommandLine -FilePath $Bin -Arguments $Args
 
   if ($Existing) {
-    & sc.exe config $ServiceName binPath= $BinPath start= auto | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务配置更新失败' }
+    if (-not (Set-ServiceBinaryPath -Name $ServiceName -BinaryPathName $BinPath)) { Fail 'Zeno Agent 服务配置更新失败' }
+    $ServiceBinPathChanged = $true
+    & sc.exe config $ServiceName start= auto | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务启动策略更新失败' }
   } else {
     New-Service -Name $ServiceName -BinaryPathName $BinPath -DisplayName 'Zeno Agent' -StartupType Automatic | Out-Null
     $CreatedService = $true
@@ -619,9 +638,14 @@ try {
       [Console]::Error.WriteLine("新 runtime token 的旧 ACL 策略恢复失败: $_")
     }
   }
-  if ($OldBinaryPathName -and -not $CreatedService) {
-    & sc.exe config $ServiceName binPath= $OldBinaryPathName | Out-Null
-    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('旧服务 binPath 恢复失败') }
+  if ($ServiceBinPathChanged -and $OldBinaryPathName -and -not $CreatedService) {
+    try {
+      if (-not (Set-ServiceBinaryPath -Name $ServiceName -BinaryPathName $OldBinaryPathName)) {
+        [Console]::Error.WriteLine('旧服务 binPath 恢复失败')
+      }
+    } catch {
+      [Console]::Error.WriteLine("旧服务 binPath 恢复失败: $_")
+    }
   }
   if ($ServiceSidTypeChanged -and $null -ne $OldServiceSidType -and -not $CreatedService) {
     $restoreSidType = Convert-ServiceSidTypeToScValue -SidType $OldServiceSidType
