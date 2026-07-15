@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,16 +16,43 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25.12'
           check-latest: true
+      - name: Enforce release version and source policy
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          bash scripts/check-release-policy.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" origin/main
+          release_status=$(curl -sS -o /tmp/existing-release.json -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          case "$release_status" in
+            404) ;;
+            200) echo "release already exists for $GITHUB_REF_NAME" >&2; exit 1 ;;
+            *) echo "cannot verify release uniqueness (GitHub API HTTP $release_status)" >&2; exit 1 ;;
+          esac
       - run: go mod tidy
       - run: git diff --exit-code -- go.mod go.sum
       - run: go test -race ./...
       - run: go vet ./...
       - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - run: $(go env GOPATH)/bin/staticcheck ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Run vulnerability gate for every released operating system
+        run: |
+          govulncheck="$(go env GOPATH)/bin/govulncheck"
+          for goos in linux darwin windows; do
+            echo "govulncheck GOOS=$goos GOARCH=amd64"
+            GOOS="$goos" GOARCH=amd64 "$govulncheck" ./...
+          done
       - run: bash -n install.sh
       - shell: pwsh
         run: '[void][scriptblock]::Create((Get-Content -Raw install.ps1))'
@@ -35,6 +61,10 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist
+          version="$(tr -d '\r\n' < VERSION)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          fi
           for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             goos=${target%/*}
             goarch=${target#*/}
@@ -49,9 +79,9 @@ jobs:
             if [ "$goarch" = "arm" ]; then
               # The single linux_arm asset is consumed by both armv6l and
               # armv7l installers. GOARM=6 is the compatible contract for both.
-              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM=6 go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM=6 go build -trimpath -ldflags "-s -w -X main.defaultVersion=$version" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
             else
-              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "-s -w" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "-s -w -X main.defaultVersion=$version" -o "$out_dir/zeno-agent${ext}" ./cmd/zeno-agent
             fi
             if [ "$archive" = "zip" ]; then
               (cd dist && zip -qr "zeno-agent_${goos}_${goarch}.zip" "zeno-agent_${goos}_${goarch}")
@@ -59,7 +89,56 @@ jobs:
               tar -C dist -czf "dist/zeno-agent_${goos}_${goarch}.tar.gz" "zeno-agent_${goos}_${goarch}"
             fi
           done
-          (cd dist && sha256sum zeno-agent_*.tar.gz zeno-agent_*.zip > SHA256SUMS)
+      - name: Generate artifact-specific Agent CycloneDX SBOMs
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.9.0
+          cyclonedx="$(go env GOPATH)/bin/cyclonedx-gomod"
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            output="dist/zeno-agent_${goos}_${goarch}.cdx.json"
+            if [ "$goarch" = "arm" ]; then
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM=6 "$cyclonedx" app -json -output "$output" -main cmd/zeno-agent .
+            else
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$cyclonedx" app -json -output "$output" -main cmd/zeno-agent .
+            fi
+          done
+      - name: Validate artifact-specific SBOM coverage
+        run: |
+          export SBOM_VERSION="$(tr -d '\r\n' < VERSION)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            export SBOM_VERSION="$GITHUB_REF_NAME"
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import parse_qs, urlsplit
+
+          targets = [
+              ("linux", "amd64"), ("linux", "arm64"), ("linux", "arm"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          ]
+          version = os.environ["SBOM_VERSION"]
+          for goos, goarch in targets:
+              path = Path(f"dist/zeno-agent_{goos}_{goarch}.cdx.json")
+              document = json.loads(path.read_text())
+              component = document["metadata"]["component"]
+              if component.get("version") != version:
+                  raise SystemExit(f"{path}: component version {component.get('version')!r} != {version!r}")
+              query = parse_qs(urlsplit(component["purl"]).query)
+              if query.get("goos") != [goos] or query.get("goarch") != [goarch]:
+                  raise SystemExit(f"{path}: wrong target purl {component['purl']!r}")
+              properties = {item.get("name"): item.get("value") for item in component.get("properties", [])}
+              if properties.get("cdx:gomod:build:env:CGO_ENABLED") != "0":
+                  raise SystemExit(f"{path}: CGO_ENABLED is not 0")
+              names = {item.get("name") for item in document.get("components", [])}
+              if goos in {"darwin", "windows"} and "golang.org/x/sys" not in names:
+                  raise SystemExit(f"{path}: missing platform dependency golang.org/x/sys")
+          PY
+      - name: Generate release checksums
+        run: (cd dist && sha256sum zeno-agent_*.tar.gz zeno-agent_*.zip zeno-agent_*.cdx.json > SHA256SUMS)
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         id: provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -75,4 +154,5 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+            dist/zeno-agent_*.cdx.json
             dist/zeno-agent_provenance.sigstore.json

@@ -64,6 +64,59 @@ func TestReleaseProvenanceAssetMatchesInstallers(t *testing.T) {
 	}
 }
 
+func TestReleasePolicyVersionInjectionVulnerabilityGateAndSBOM(t *testing.T) {
+	workflowBytes, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+	workflow := string(workflowBytes)
+	for _, want := range []string{
+		"fetch-depth: 0",
+		"scripts/check-release-policy.sh",
+		"release already exists",
+		"govulncheck@v1.6.0",
+		"for goos in linux darwin windows",
+		`GOOS="$goos" GOARCH=amd64 "$govulncheck" ./...`,
+		"cyclonedx-gomod@v1.9.0",
+		"for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64",
+		`zeno-agent_${goos}_${goarch}.cdx.json`,
+		`CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch"`,
+		"Validate artifact-specific SBOM coverage",
+		"cdx:gomod:build:env:CGO_ENABLED",
+		"CGO_ENABLED is not 0",
+		"missing platform dependency golang.org/x/sys",
+		"zeno-agent_*.cdx.json",
+		"-X main.defaultVersion=$version",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("release workflow missing policy contract %q", want)
+		}
+	}
+	if strings.Contains(workflow, "dist/zeno-agent.cdx.json") {
+		t.Fatal("release workflow still emits a single host-specific SBOM for all artifacts")
+	}
+	if strings.Contains(workflow, "workflow_dispatch") {
+		t.Fatal("tag-only release workflow must not expose a manual dispatch path that cannot satisfy tag-derived SBOM versioning")
+	}
+	policyBytes, err := os.ReadFile("scripts/check-release-policy.sh")
+	if err != nil {
+		t.Fatalf("read release policy: %v", err)
+	}
+	policy := string(policyBytes)
+	for _, want := range []string{"strict SemVer", "VERSION", "merge-base --is-ancestor", "not greater than existing SemVer"} {
+		if !strings.Contains(policy, want) {
+			t.Fatalf("release policy missing %q", want)
+		}
+	}
+	versionBytes, err := os.ReadFile("VERSION")
+	if err != nil {
+		t.Fatalf("read VERSION: %v", err)
+	}
+	if version := strings.TrimSpace(string(versionBytes)); version != "v0.5.0" {
+		t.Fatalf("VERSION = %q, want current formal version v0.5.0", version)
+	}
+}
+
 func TestEnrollmentIsPersistedBeforeOneTimeExchange(t *testing.T) {
 	unixBytes, err := os.ReadFile("install.sh")
 	if err != nil {
@@ -96,9 +149,9 @@ func TestEnrollmentIsPersistedBeforeOneTimeExchange(t *testing.T) {
 	if writeIndex < 0 || exchangeIndex < 0 || writeIndex > exchangeIndex {
 		t.Fatal("Windows installer must persist the runtime token before consuming enrollment")
 	}
-	aclIndex := strings.Index(windowsMain, "Assert-StrictTokenAcl -Path $TokenFile")
 	installedIndex := strings.Index(windowsMain, "$EnrollmentTokenInstalled = $true")
-	if aclIndex < 0 || installedIndex < 0 || aclIndex > installedIndex {
-		t.Fatal("Windows installer must not retain the new token on rollback until its service ACL is usable")
+	serviceChangeIndex := strings.Index(windowsMain, "$BinPath = Join-WindowsCommandLine")
+	if installedIndex < 0 || serviceChangeIndex < 0 || installedIndex < exchangeIndex || installedIndex > serviceChangeIndex {
+		t.Fatal("Windows installer must preserve the exchanged runtime token before any later SCM change can fail")
 	}
 }

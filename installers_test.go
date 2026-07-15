@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -21,13 +22,20 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"ExecStart=$exec_start",
 		"atomic_install_binary",
 		"restore_binary_backup",
+		"rotate_binary_backups",
 		"restore_file_backup_atomic",
 		".${dest_base}.restore.$$",
 		"sha256_file \"$backup\"",
 		"stop_linux_service_for_restore",
 		"reject_symlink_path \"$TOKEN_FILE\" \"token 文件\"",
 		"token_owner_group()",
-		"root:root",
+		"ensure_linux_service_account()",
+		"useradd --system --user-group --no-create-home",
+		"service_account_created=1",
+		"remove_created_linux_service_account",
+		`userdel "$SERVICE_USER"`,
+		`groupdel "$SERVICE_GROUP"`,
+		"root:%s",
 		"root:wheel",
 		"set_token_owner_mode \"$tmp_token\"",
 		"assert_token_file_secure",
@@ -37,11 +45,13 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"service_was_enabled",
 		"service_was_active",
 		"if [ \"$service_was_active\" -eq 1 ]; then",
-		"$dest.bak-$(date -u +%Y%m%d%H%M%S)",
+		"$dest.bak-$(date -u +%Y%m%d%H%M%S)-$$",
 		"chown root:root \"$unit\"",
 		"chown root:wheel \"$plist\"",
 		"plutil -lint \"$plist_tmp\"",
 		"NoNewPrivileges=true",
+		"User=$SERVICE_USER",
+		"Group=$SERVICE_GROUP",
 		"ProtectSystem=full",
 		"ProtectHome=read-only",
 		"ProtectKernelTunables=true",
@@ -49,10 +59,13 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"CapabilityBoundingSet=CAP_NET_RAW",
 		"AmbientCapabilities=CAP_NET_RAW",
 		"RestrictNamespaces=true",
+		"RestrictSUIDSGID=true",
 		"MemoryDenyWriteExecute=true",
 		"ProcessType</key><string>Background",
 		"<key>Umask</key><integer>63</integer>",
 		"validate_controller_url",
+		"insecure_args=(-allow-insecure-http)",
+		"<string>-allow-insecure-http</string>",
 		"远程 ZENO_CONTROLLER_URL 必须使用 https",
 	} {
 		if !strings.Contains(script, want) {
@@ -109,6 +122,189 @@ func TestUnixSystemdEscapeBehavior(t *testing.T) {
 	}
 }
 
+func TestUnixBinaryBackupRotationKeepsNewestThree(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	dir := t.TempDir()
+	destination := dir + "/zeno-agent"
+	for _, suffix := range []string{"20260101-1", "20260201-1", "20260301-1", "20260401-1", "20260501-1"} {
+		if err := os.WriteFile(destination+".bak-"+suffix, []byte(suffix), 0o600); err != nil {
+			t.Fatalf("write backup: %v", err)
+		}
+	}
+	fragment := extractShellFunction(t, string(content), "rotate_binary_backups") + "\nrotate_binary_backups \"$1\"\n"
+	if output, err := exec.Command("bash", "-c", fragment, "bash", destination).CombinedOutput(); err != nil {
+		t.Fatalf("rotate_binary_backups: %v\n%s", err, output)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read backup directory: %v", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	want := []string{"zeno-agent.bak-20260301-1", "zeno-agent.bak-20260401-1", "zeno-agent.bak-20260501-1"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("remaining backups = %v, want %v", names, want)
+	}
+}
+
+func TestUnixTokenRollbackRestoresOriginalMetadata(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	script := string(content)
+	if strings.Contains(script, `set_token_owner_mode "$backup_token"`) {
+		t.Fatal("token backup must retain the original owner and mode")
+	}
+	fragment := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "reject_symlink_path") + "\n" +
+		extractShellFunction(t, script, "restore_file_backup_atomic") + "\n" +
+		extractShellFunction(t, script, "file_owner_mode") + "\n" +
+		extractShellFunction(t, script, "restore_token_backup") + "\n" +
+		"GOOS=linux\nbackup_token=\"$1\"\nTOKEN_FILE=\"$2\"\nrestore_token_backup\n"
+
+	dir := t.TempDir()
+	backup := dir + "/token.backup"
+	token := dir + "/agent-token"
+	if err := os.WriteFile(backup, []byte("old-token\n"), 0o600); err != nil {
+		t.Fatalf("write backup: %v", err)
+	}
+	if err := os.WriteFile(token, []byte("new-token\n"), 0o640); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	backupInfo, err := os.Stat(backup)
+	if err != nil {
+		t.Fatalf("stat backup: %v", err)
+	}
+	backupStat := backupInfo.Sys().(*syscall.Stat_t)
+	if out, err := exec.Command("bash", "-c", fragment, "bash", backup, token).CombinedOutput(); err != nil {
+		t.Fatalf("restore_token_backup: %v\n%s", err, out)
+	}
+	info, err := os.Stat(token)
+	if err != nil {
+		t.Fatalf("stat restored token: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("restored token mode = %04o, want original 0600", got)
+	}
+	restoredStat := info.Sys().(*syscall.Stat_t)
+	if restoredStat.Uid != backupStat.Uid || restoredStat.Gid != backupStat.Gid {
+		t.Fatalf("restored token owner = %d:%d, want original %d:%d", restoredStat.Uid, restoredStat.Gid, backupStat.Uid, backupStat.Gid)
+	}
+	if data, err := os.ReadFile(token); err != nil || string(data) != "old-token\n" {
+		t.Fatalf("restored token = %q, %v", data, err)
+	}
+}
+
+func TestUnixExistingServiceAccountMustBePrivateSystemAccount(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	script := string(content)
+	base := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "ensure_linux_service_account") + "\n" +
+		"GOOS=linux\nSERVICE_USER=zeno-agent\nSERVICE_GROUP=zeno-agent\nservice_account_created=0\n"
+
+	tests := []struct {
+		name      string
+		passwd    string
+		allUsers  string
+		group     string
+		allGroups string
+		wantError bool
+	}{
+		{
+			name:      "private system account",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "root:x:0:0::/root:/bin/bash\nzeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			group:     "zeno-agent:x:995:",
+			allGroups: "root:x:0:\nzeno-agent:x:995:",
+		},
+		{
+			name:      "interactive ordinary account",
+			passwd:    "zeno-agent:x:1000:1000::/home/zeno-agent:/bin/bash",
+			allUsers:  "zeno-agent:x:1000:1000::/home/zeno-agent:/bin/bash",
+			group:     "zeno-agent:x:1000:",
+			allGroups: "zeno-agent:x:1000:",
+			wantError: true,
+		},
+		{
+			name:      "shared primary group",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin\nother:x:996:995::/nonexistent:/usr/sbin/nologin",
+			group:     "zeno-agent:x:995:",
+			allGroups: "zeno-agent:x:995:",
+			wantError: true,
+		},
+		{
+			name:      "supplementary group member",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin\nother:x:996:996::/nonexistent:/usr/sbin/nologin",
+			group:     "zeno-agent:x:995:other",
+			allGroups: "zeno-agent:x:995:other",
+			wantError: true,
+		},
+		{
+			name:      "duplicate numeric gid",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			group:     "zeno-agent:x:995:",
+			allGroups: "zeno-agent:x:995:\nalias:x:995:other",
+			wantError: true,
+		},
+		{
+			name:      "duplicate same-name passwd records",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin\nzeno-agent:x:1000:1000::/home/zeno-agent:/bin/bash",
+			group:     "zeno-agent:x:995:",
+			allGroups: "zeno-agent:x:995:",
+			wantError: true,
+		},
+		{
+			name:      "duplicate same-name group records",
+			passwd:    "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			allUsers:  "zeno-agent:x:995:995::/nonexistent:/usr/sbin/nologin",
+			group:     "zeno-agent:x:995:",
+			allGroups: "zeno-agent:x:995:\nzeno-agent:x:996:other",
+			wantError: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := `getent() {
+  if [ "$1" = passwd ] && [ "${2-}" = zeno-agent ]; then printf '%s\n' "$MOCK_PASSWD"; return 0; fi
+  if [ "$1" = passwd ] && [ -z "${2-}" ]; then printf '%s\n' "$MOCK_ALL_USERS"; return 0; fi
+  if [ "$1" = group ] && [ "${2-}" = zeno-agent ]; then printf '%s\n' "$MOCK_GROUP"; return 0; fi
+  if [ "$1" = group ] && [ -z "${2-}" ]; then printf '%s\n' "$MOCK_ALL_GROUPS"; return 0; fi
+  return 2
+}
+ensure_linux_service_account
+`
+			cmd := exec.Command("bash", "-c", base+mock)
+			cmd.Env = append(os.Environ(), "MOCK_PASSWD="+tc.passwd, "MOCK_ALL_USERS="+tc.allUsers, "MOCK_GROUP="+tc.group, "MOCK_ALL_GROUPS="+tc.allGroups)
+			out, err := cmd.CombinedOutput()
+			if tc.wantError && err == nil {
+				t.Fatalf("unsafe existing account was accepted: %s", out)
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("safe service account rejected: %v\n%s", err, out)
+			}
+		})
+	}
+	ensureFunction := extractShellFunction(t, script, "ensure_linux_service_account")
+	useraddIndex := strings.Index(ensureFunction, "if ! useradd ")
+	createdIndex := strings.Index(ensureFunction, "service_account_created=1")
+	if useraddIndex < 0 || createdIndex < 0 || createdIndex < useraddIndex {
+		t.Fatal("service account cleanup marker must only be set after useradd succeeds")
+	}
+}
+
 func TestUnixControllerURLValidation(t *testing.T) {
 	content, err := os.ReadFile("install.sh")
 	if err != nil {
@@ -120,15 +316,23 @@ func TestUnixControllerURLValidation(t *testing.T) {
 		extractShellFunction(t, script, "is_ipv4_loopback") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_literal") + "\n" +
 		extractShellFunction(t, script, "is_hex16") + "\n" +
+		extractShellFunction(t, script, "is_ipv6_literal") + "\n" +
+		extractShellFunction(t, script, "is_ipv6_loopback") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_mapped_hex_loopback") + "\n" +
 		extractShellFunction(t, script, "is_ipv4_mapped_loopback") + "\n" +
 		extractShellFunction(t, script, "controller_url_host") + "\n" +
 		extractShellFunction(t, script, "controller_url_has_explicit_port") + "\n" +
 		extractShellFunction(t, script, "validate_controller_url") + "\n"
-	for _, value := range []string{"https://zeno.example.com", "http://localhost:18980", "http://localhost.:18980", "http://127.0.0.1:18980", "http://127.0.0.2:18980", "http://127.255.255.255:18980", "http://203.0.113.10:18980", "http://[::1]:18980", "http://[::ffff:127.0.0.1]:18980", "http://[::ffff:7f00:1]:18980", "http://[::ffff:192.168.1.1]:18980", "http://[::ffff:8000:1]:18980", "http://[2001:db8::10]:18980"} {
-		cmd := exec.Command("bash", "-c", fragment+"validate_controller_url \"$1\"", "bash", value)
+	for _, value := range []string{"https://zeno.example.com", "http://localhost:18980", "http://localhost.:18980", "http://127.0.0.1:18980", "http://127.0.0.2:18980", "http://127.255.255.255:18980", "http://[::1]:18980", "http://[::ffff:127.0.0.1]:18980", "http://[::ffff:7f00:1]:18980"} {
+		cmd := exec.Command("bash", "-c", "ALLOW_INSECURE_HTTP=0\n"+fragment+"validate_controller_url \"$1\" && [ \"$ALLOW_INSECURE_HTTP\" -eq 0 ]", "bash", value)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("validate_controller_url rejected %q: %v\n%s", value, err, out)
+			t.Fatalf("validate_controller_url did not preserve secure default for %q: %v\n%s", value, err, out)
+		}
+	}
+	for _, value := range []string{"http://203.0.113.10:80", "http://203.0.113.10:18980", "http://[::ffff:192.168.1.1]:18980", "http://[::ffff:8000:1]:18980", "http://[2001:db8::10]:18980"} {
+		cmd := exec.Command("bash", "-c", "ALLOW_INSECURE_HTTP=0\n"+fragment+"validate_controller_url \"$1\" && [ \"$ALLOW_INSECURE_HTTP\" -eq 1 ]", "bash", value)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("validate_controller_url did not require explicit runtime opt-in for %q: %v\n%s", value, err, out)
 		}
 	}
 	for _, value := range []string{
@@ -141,6 +345,8 @@ func TestUnixControllerURLValidation(t *testing.T) {
 		"http://203.0.113.10",
 		"http://[2001:db8::10]",
 		"http://[::1]evil:18980",
+		"http://[not:ipv6]:18980",
+		"http://[2001::db8::10]:18980",
 		"https://user:pass@zeno.example.com",
 		"https://zeno.example.com?token=secret",
 		"https://zeno.example.com#fragment",
@@ -179,6 +385,7 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"Set-ServiceBinaryPath",
 		"$ServiceBinPathChanged",
 		"Restore-PreviousBinary",
+		"Remove-OldBinaryBackups",
 		"Stop-ServiceAndWait",
 		".agent-token.backup-",
 		"Set-Acl -Path $Destination -AclObject $OldAcl",
@@ -196,12 +403,14 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"$RecoveryBackupPath",
 		"zeno-agent.exe.rollback-",
 		"sc.exe sidtype",
+		"sc.exe config $ServiceName obj= \"NT SERVICE\\$ServiceName\"",
 		"sc.exe privs $ServiceName SeChangeNotifyPrivilege",
 		"拒绝覆盖现有二进制",
 		"原备份仍保留在",
 		"token 文件恢复失败，备份仍保留在",
 		"Assert-ControllerURL",
 		"远程 ZENO_CONTROLLER_URL 必须使用 https",
+		"if ($AllowInsecureHTTP) { $Args += '-allow-insecure-http' }",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("install.ps1 missing %q", want)
@@ -224,6 +433,23 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 	}
 	if strings.Contains(script, "ZENO_AGENT_SERVICE_NAME") {
 		t.Fatalf("install.ps1 exposes a custom service name that the Windows binary cannot register")
+	}
+}
+
+func TestWindowsEnrollmentExchangeCommitsPendingTokenBeforeSCMChanges(t *testing.T) {
+	scriptBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	script := string(scriptBytes)
+	exchange := strings.Index(script, "Invoke-AgentEnrollment -RuntimeToken $Token")
+	commit := strings.Index(script, "$EnrollmentTokenInstalled = $true")
+	serviceChange := strings.Index(script, "$BinPath = Join-WindowsCommandLine")
+	if exchange < 0 || commit < 0 || serviceChange < 0 {
+		t.Fatalf("installer is missing enrollment persistence or SCM setup markers")
+	}
+	if !(exchange < commit && commit < serviceChange) {
+		t.Fatalf("pending runtime token must be committed immediately after enrollment exchange and before SCM changes")
 	}
 }
 

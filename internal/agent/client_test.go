@@ -51,6 +51,39 @@ func TestClientRejectsRemotePlainHTTPBeforeSendingToken(t *testing.T) {
 	}
 }
 
+func TestValidateControllerURLExplicitInsecureHTTPContract(t *testing.T) {
+	allowed := []string{
+		"http://198.51.100.10:80",
+		"http://198.51.100.10:18980",
+		"http://[2001:db8::10]:18980",
+		"http://[::ffff:192.168.1.1]:18980",
+	}
+	for _, value := range allowed {
+		if err := ValidateControllerURL(value); err == nil {
+			t.Fatalf("default validation accepted insecure URL %q", value)
+		}
+		if err := ValidateControllerURLWithOptions(value, true); err != nil {
+			t.Fatalf("opt-in validation rejected %q: %v", value, err)
+		}
+	}
+	for _, value := range []string{
+		"http://198.51.100.10",
+		"http://198.51.100.10:0",
+		"http://198.51.100.10:65536",
+		"http://[2001:db8::10]",
+		"http://zeno.example.com:18980",
+		"http://user@198.51.100.10:18980",
+	} {
+		if err := ValidateControllerURLWithOptions(value, true); err == nil {
+			t.Fatalf("opt-in validation accepted out-of-contract URL %q", value)
+		}
+	}
+	client := NewClientWithOptions("http://198.51.100.10:18980", "node", "token", ClientOptions{AllowInsecureHTTP: true})
+	if got, err := client.PresenceWebSocketURL(); err != nil || got != "ws://198.51.100.10:18980/api/agent/v1/presence/ws" {
+		t.Fatalf("opt-in websocket URL = %q, %v", got, err)
+	}
+}
+
 func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 	var sawPath, sawNode, sawAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

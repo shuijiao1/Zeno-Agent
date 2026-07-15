@@ -25,6 +25,7 @@ $NetworkInterfaces = $env:ZENO_AGENT_NETWORK_INTERFACES
 $DiskMounts = $env:ZENO_AGENT_DISK_MOUNTS
 # The Windows binary registers this exact SCM service name in svc.Run.
 $ServiceName = 'zeno-agent'
+$AllowInsecureHTTP = $false
 
 function Fail($Message) {
   throw "错误: $Message"
@@ -330,6 +331,16 @@ function Restore-PreviousBinary($Backup, $Destination, $ServiceName) {
   }
 }
 
+function Remove-OldBinaryBackups($Destination, [int]$Keep = 3) {
+  $directory = Split-Path -Parent $Destination
+  $leaf = Split-Path -Leaf $Destination
+  Get-ChildItem -LiteralPath $directory -File -ErrorAction Stop |
+    Where-Object { $_.Name.StartsWith($leaf + '.bak-', [StringComparison]::Ordinal) } |
+    Sort-Object LastWriteTimeUtc, Name -Descending |
+    Select-Object -Skip $Keep |
+    Remove-Item -Force -ErrorAction Stop
+}
+
 function Assert-RegularFileOrAbsent($Path, $Label) {
   if (-not (Test-Path -LiteralPath $Path)) { return }
   $item = Get-Item -Force -LiteralPath $Path
@@ -381,6 +392,7 @@ function Convert-ServiceSidTypeToScValue($SidType) {
 }
 
 function Assert-ControllerURL($Value) {
+  $script:AllowInsecureHTTP = $false
   $parsed = $null
   if (-not [Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$parsed)) {
     Fail 'ZENO_CONTROLLER_URL 不是有效的绝对 URL'
@@ -394,7 +406,15 @@ function Assert-ControllerURL($Value) {
     $isIPAddress = [Net.IPAddress]::TryParse($parsed.DnsSafeHost, [ref]$address)
     $isLoopbackAddress = $isIPAddress -and [Net.IPAddress]::IsLoopback($address)
     if ($parsed.DnsSafeHost -eq 'localhost' -or $isLoopbackAddress) { return }
-    if ($isIPAddress -and -not $parsed.IsDefaultPort) { return }
+    $authorityMatch = [Text.RegularExpressions.Regex]::Match($Value, '^[A-Za-z][A-Za-z0-9+.-]*://([^/]+)')
+    $authority = if ($authorityMatch.Success) { $authorityMatch.Groups[1].Value } else { '' }
+    $hasExplicitPort = ($authority -match '^\[[^]]+\]:[0-9]+$') -or ($authority -match '^[^:]+:[0-9]+$')
+    if ($isIPAddress -and $hasExplicitPort -and $parsed.Port -ge 1 -and $parsed.Port -le 65535) {
+      # Persist this explicit plaintext-token opt-in in the SCM binPath. The
+      # Agent runtime remains fail-closed for every other remote HTTP URL.
+      $script:AllowInsecureHTTP = $true
+      return
+    }
   }
   if ($parsed.Scheme -eq 'http') { Fail '远程 ZENO_CONTROLLER_URL 必须使用 https' }
   Fail 'ZENO_CONTROLLER_URL 必须使用 http 或 https'
@@ -404,6 +424,9 @@ if (-not $ControllerURL) { Fail '必须设置 ZENO_CONTROLLER_URL' }
 if (-not $NodeID) { Fail '必须设置 ZENO_NODE_ID' }
 if ($Token -and $EnrollmentToken) { Fail 'ZENO_AGENT_TOKEN 与 ZENO_ENROLLMENT_TOKEN 不能同时设置' }
 Assert-ControllerURL $ControllerURL
+if ($AllowInsecureHTTP) {
+  Write-Warning '远程 Controller 使用 HTTP；enrollment/runtime bearer token 将以明文传输，并会在服务配置中持久化显式 opt-in。'
+}
 $ExistingTokenUsable = (Test-Path -LiteralPath $TokenFile -PathType Leaf) -and ((Get-Item -LiteralPath $TokenFile).Length -gt 0)
 if (-not $Token -and -not $EnrollmentToken -and -not $ExistingTokenUsable) { Fail '必须设置 ZENO_ENROLLMENT_TOKEN、ZENO_AGENT_TOKEN 或提供已有非空 token 文件' }
 
@@ -531,11 +554,12 @@ try {
   }
   if ($EnrollmentToken) {
     # Persist the generated runtime token before consuming the one-time
-    # enrollment credential. Until the service ACL is installed below, a
-    # later failure safely restores the prior token (which remains active
-    # until the pending runtime token authenticates).
+    # enrollment credential. Once exchange succeeds this token is the only
+    # recoverable credential on a fresh install, so every later rollback must
+    # preserve its contents even if SCM/ACL setup subsequently fails.
     Invoke-AgentEnrollment -RuntimeToken $Token
     $EnrollmentExchangeSucceeded = $true
+    $EnrollmentTokenInstalled = $true
     $EnrollmentToken = $null
   }
 
@@ -551,6 +575,7 @@ try {
   )
   if ($NetworkInterfaces) { $Args += @('-network-interfaces', $NetworkInterfaces) }
   if ($DiskMounts) { $Args += @('-disk-mounts', $DiskMounts) }
+  if ($AllowInsecureHTTP) { $Args += '-allow-insecure-http' }
   $BinPath = Join-WindowsCommandLine -FilePath $Bin -Arguments $Args
 
   if ($Existing) {
@@ -564,6 +589,11 @@ try {
   }
   if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
   if ($CreatedService) {
+    # Fresh installs run as the per-service virtual account instead of
+    # LocalSystem. Existing services are not account-migrated here because the
+    # installer cannot safely recover an unknown prior account password.
+    & sc.exe config $ServiceName obj= "NT SERVICE\$ServiceName" password= "" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 虚拟服务账户配置失败' }
     & sc.exe sidtype $ServiceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
     & sc.exe privs $ServiceName SeChangeNotifyPrivilege | Out-Null
@@ -580,17 +610,19 @@ try {
 
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
-  if ($EnrollmentExchangeSucceeded) {
-    # From this point the restored service can read and authenticate with the
-    # pending runtime token. Never roll its contents back after a later error.
-    $EnrollmentTokenInstalled = $true
-  }
 
   Start-Service -Name $ServiceName
   if (-not (Wait-ServiceRunning -Name $ServiceName)) { Fail 'Zeno Agent 服务未进入 Running 状态' }
 
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
-  if ($BackupBin) { Write-Host "已保留旧二进制: $BackupBin" }
+  if ($BackupBin) {
+    try {
+      Remove-OldBinaryBackups -Destination $Bin -Keep 3
+    } catch {
+      Write-Warning "旧二进制备份轮转失败；请手动仅保留最新 3 份: $Bin.bak-*"
+    }
+    Write-Host "已保留旧二进制: $BackupBin"
+  }
   Write-Host "Zeno Agent 已安装并启动: node=$NodeID version=$Version"
   $InstallSucceeded = $true
 } catch {

@@ -15,7 +15,11 @@ import (
 	"github.com/shuijiao1/Zeno-Agent/internal/agent"
 )
 
-const defaultVersion = "zeno-agent-dev"
+// defaultVersion is replaced by the release workflow via -ldflags -X. Keep it
+// a variable so standalone release binaries report the formal release version
+// even when no installer-supplied -version flag is present.
+var defaultVersion = "zeno-agent-dev"
+
 const defaultStateInterval = 3 * time.Second
 const defaultHeartbeatInterval = 15 * time.Second
 const defaultHostInterval = 30 * time.Minute
@@ -39,6 +43,7 @@ type config struct {
 	IdentityRefreshInterval time.Duration
 	NetworkInterfaces       string
 	DiskMounts              string
+	AllowInsecureHTTP       bool
 }
 
 func main() {
@@ -57,6 +62,7 @@ func main() {
 	flag.DurationVar(&cfg.IdentityRefreshInterval, "identity-refresh-interval", defaultIdentityRefreshInterval, "public IPv4/IPv6 and GeoIP refresh interval; best-effort and cached")
 	flag.StringVar(&cfg.NetworkInterfaces, "network-interfaces", "", "comma-separated network interface allowlist; default excludes virtual/container interfaces")
 	flag.StringVar(&cfg.DiskMounts, "disk-mounts", "", "comma-separated disk mount/path allowlist; default sums real filesystems")
+	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "explicitly allow a direct IP controller with an explicit port over HTTP (bearer token is sent in plaintext)")
 	flag.Parse()
 	if legacyInterval > 0 {
 		cfg.StateInterval = legacyInterval
@@ -95,10 +101,10 @@ func normalizeConfigIntervals(cfg *config) {
 
 func run(ctx context.Context, cfg config) error {
 	normalizeConfigIntervals(&cfg)
-	if err := agent.ValidateControllerURL(cfg.ControllerURL); err != nil {
+	if err := agent.ValidateControllerURLWithOptions(cfg.ControllerURL, cfg.AllowInsecureHTTP); err != nil {
 		return err
 	}
-	client := agent.NewClient(cfg.ControllerURL, cfg.NodeID, cfg.Token)
+	client := agent.NewClientWithOptions(cfg.ControllerURL, cfg.NodeID, cfg.Token, agent.ClientOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
 	collector := agent.NewMetricsCollector(agent.MetricsOptions{NetworkInterfaceAllowlist: splitCommaList(cfg.NetworkInterfaces), DiskMountAllowlist: splitCommaList(cfg.DiskMounts)})
 	identityDiscoverer := agent.NewCachedNetworkIdentityDiscoverer(agent.NewNetworkIdentityDiscoverer(), cfg.IdentityRefreshInterval)
 	return runAgent(ctx, cfg, client, collector, identityDiscoverer)
@@ -259,46 +265,6 @@ func reportHost(ctx context.Context, client *agent.Client, collector *agent.Metr
 func reportState(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector) error {
 	now := time.Now().UTC()
 	return client.PostState(ctx, collector.CollectState(now))
-}
-
-// reportOnce is retained for tests and one-off callers, but no longer drives the daemon loop.
-func reportOnce(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector, version string, includeHost bool, scheduler *agent.ProbeScheduler, identityDiscoverer networkIdentityDiscoverer) error {
-	if err := reportHeartbeat(ctx, client, version); err != nil {
-		return err
-	}
-	if includeHost {
-		if err := reportHost(ctx, client, collector, version, identityDiscoverer); err != nil {
-			return err
-		}
-	}
-	if err := reportState(ctx, client, collector); err != nil {
-		return err
-	}
-	targets, err := client.FetchProbeTargets(ctx)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	dueTargets := targets
-	if scheduler != nil {
-		dueTargets = scheduler.Due(targets, now)
-	}
-	dueTargets = agent.LimitProbeTargetsForRun(dueTargets)
-	if len(dueTargets) > 0 {
-		rounds := agent.ProbeTargets(ctx, dueTargets, now)
-		if err := client.PostProbeResults(ctx, rounds); err != nil {
-			return err
-		}
-		if scheduler != nil {
-			scheduler.MarkCompleted(dueTargets, now)
-		}
-	}
-	log.Printf("reported host/state and %d probe target(s)", len(dueTargets))
-	return nil
-}
-
-func reportStateOnly(ctx context.Context, client *agent.Client, collector *agent.MetricsCollector) error {
-	return reportState(ctx, client, collector)
 }
 
 type probeTargetManager struct {

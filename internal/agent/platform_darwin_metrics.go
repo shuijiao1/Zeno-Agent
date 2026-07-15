@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -39,19 +40,21 @@ func darwinProcessCount() int64 {
 }
 
 func darwinConnectionCounts() (tcp int64, udp int64, err error) {
-	output, err := darwinCommandOutput("/usr/sbin/netstat", "-an")
+	parser := darwinConnectionParser{}
+	err = darwinCommandScanLinesWithLimits(context.Background(), darwinMetricsCommandTimeout, darwinMetricsMaxLines, darwinMetricsMaxLineBytes, parser.consume, "/usr/sbin/netstat", "-an")
 	if err != nil {
 		return 0, 0, err
 	}
-	return parseDarwinConnectionCountsResult(output)
+	return parser.result()
 }
 
 func darwinNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) {
-	output, err := darwinCommandOutput("/usr/sbin/netstat", "-ibn")
+	parser := newDarwinNetworkParser(allowlist)
+	err := darwinCommandScanLinesWithLimits(context.Background(), darwinMetricsCommandTimeout, darwinMetricsMaxLines, darwinMetricsMaxLineBytes, parser.consume, "/usr/sbin/netstat", "-ibn")
 	if err != nil {
 		return networkTotals{}, err
 	}
-	return parseDarwinNetworkTotalsResult(output, allowlist)
+	return parser.result()
 }
 
 func darwinOSRelease() (string, string) {

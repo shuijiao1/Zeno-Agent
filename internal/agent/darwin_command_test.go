@@ -69,6 +69,50 @@ func TestDarwinCommandOutputReturnsBoundedSuccess(t *testing.T) {
 	}
 }
 
+func TestDarwinCommandStreamingParserHandlesOutputLargerThanScalarBuffer(t *testing.T) {
+	parser := darwinConnectionParser{}
+	err := darwinCommandScanLinesWithLimits(
+		context.Background(),
+		2*time.Second,
+		10_000,
+		4096,
+		parser.consume,
+		os.Args[0],
+		"-test.run=^TestDarwinCommandHelperProcess$",
+		"--",
+		darwinCommandHelperMarker,
+		"netstat",
+	)
+	if err != nil {
+		t.Fatalf("stream netstat output: %v", err)
+	}
+	tcp, udp, err := parser.result()
+	if err != nil {
+		t.Fatalf("stream parser result: %v", err)
+	}
+	if tcp != 3000 || udp != 2000 {
+		t.Fatalf("stream counts tcp=%d udp=%d, want 3000/2000", tcp, udp)
+	}
+}
+
+func TestDarwinCommandStreamingParserEnforcesLineLimit(t *testing.T) {
+	err := darwinCommandScanLinesWithLimits(
+		context.Background(),
+		2*time.Second,
+		10,
+		4096,
+		func(string) error { return nil },
+		os.Args[0],
+		"-test.run=^TestDarwinCommandHelperProcess$",
+		"--",
+		darwinCommandHelperMarker,
+		"netstat",
+	)
+	if err == nil || !errors.Is(err, errDarwinMetricsCommandLineLimit) {
+		t.Fatalf("line-limit error = %v, want wrapped line-limit sentinel", err)
+	}
+}
+
 func TestDarwinCommandHelperProcess(t *testing.T) {
 	args := os.Args
 	if len(args) < 2 || args[len(args)-2] != darwinCommandHelperMarker {
@@ -81,6 +125,14 @@ func TestDarwinCommandHelperProcess(t *testing.T) {
 		fmt.Print(strings.Repeat("x", darwinMetricsMaxOutputBytes+1))
 	case "success":
 		fmt.Print("darwin-command-ok")
+	case "netstat":
+		fmt.Println("Proto Recv-Q Send-Q Local Address Foreign Address State")
+		for i := 0; i < 3000; i++ {
+			fmt.Printf("tcp4 0 0 127.0.0.1.%d *.* LISTEN\n", i+1000)
+		}
+		for i := 0; i < 2000; i++ {
+			fmt.Printf("udp4 0 0 127.0.0.1.%d *.*\n", i+5000)
+		}
 	default:
 		t.Fatalf("unknown helper mode %q", args[len(args)-1])
 	}

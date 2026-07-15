@@ -21,6 +21,9 @@ IDENTITY_REFRESH_INTERVAL="${ZENO_AGENT_IDENTITY_REFRESH_INTERVAL:-12h}"
 NETWORK_INTERFACES="${ZENO_AGENT_NETWORK_INTERFACES:-}"
 DISK_MOUNTS="${ZENO_AGENT_DISK_MOUNTS:-}"
 SERVICE_NAME="zeno-agent"
+SERVICE_USER="zeno-agent"
+SERVICE_GROUP="zeno-agent"
+ALLOW_INSECURE_HTTP=0
 
 fail() {
   echo "错误: $*" >&2
@@ -211,6 +214,47 @@ is_hex16() {
   [ "${#value}" -le 4 ]
 }
 
+is_ipv6_literal() {
+  local value="$1"
+  [[ "$value" == *:* ]] || return 1
+  case "$value" in
+    *[!0-9a-fA-F:.]*|*:::*) return 1 ;;
+  esac
+  if [[ "$value" == *::* ]]; then
+    local after_compression="${value#*::}"
+    [[ "$after_compression" != *::* ]] || return 1
+  else
+    case "$value" in :*|*:) return 1 ;; esac
+  fi
+
+  local groups=0 group index
+  local parts=()
+  IFS=: read -r -a parts <<<"$value"
+  for index in "${!parts[@]}"; do
+    group="${parts[$index]}"
+    [ -n "$group" ] || continue
+    if [[ "$group" == *.* ]]; then
+      [ "$index" -eq "$((${#parts[@]} - 1))" ] || return 1
+      is_ipv4_literal "$group" || return 1
+      groups=$((groups + 2))
+    else
+      is_hex16 "$group" || return 1
+      groups=$((groups + 1))
+    fi
+  done
+  if [[ "$value" == *::* ]]; then
+    [ "$groups" -lt 8 ]
+  else
+    [ "$groups" -eq 8 ]
+  fi
+}
+
+is_ipv6_loopback() {
+  local value="$1"
+  is_ipv6_literal "$value" || return 1
+  [[ "${value//:/}" =~ ^0*1$ ]]
+}
+
 is_ipv4_mapped_hex_loopback() {
   local value="$1"
   local high low extra
@@ -276,6 +320,7 @@ controller_url_has_explicit_port() {
 
 validate_controller_url() {
   local value="$1"
+  ALLOW_INSECURE_HTTP=0
   case "$value" in
     *'?'*|*'#'*) fail "ZENO_CONTROLLER_URL 不能包含查询参数或片段" ;;
   esac
@@ -296,10 +341,14 @@ validate_controller_url() {
       if [ "$localhost_host" = "localhost" ]; then
         return 0
       fi
-      if [ "$normalized_host" = "::1" ] || is_ipv4_loopback "$normalized_host" || is_ipv4_mapped_loopback "$normalized_host"; then
+      if is_ipv6_loopback "$normalized_host" || is_ipv4_loopback "$normalized_host" || is_ipv4_mapped_loopback "$normalized_host"; then
         return 0
       fi
-      if controller_url_has_explicit_port "$authority" && { is_ipv4_literal "$normalized_host" || [[ "$normalized_host" == *:* ]]; }; then
+      if controller_url_has_explicit_port "$authority" && { is_ipv4_literal "$normalized_host" || is_ipv6_literal "$normalized_host"; }; then
+        # This is the one intentionally insecure product contract. Persist the
+        # explicit runtime opt-in in the service definition below; never relax
+        # the Agent's default URL validation globally.
+        ALLOW_INSECURE_HTTP=1
         return 0
       fi
       fail "远程 ZENO_CONTROLLER_URL 必须使用 https"
@@ -361,11 +410,35 @@ atomic_install_binary() {
   local backup=""
   install -m 755 "$source" "$new_bin"
   if [ -e "$dest" ]; then
-    backup="$dest.bak-$(date -u +%Y%m%d%H%M%S)"
+    backup="$dest.bak-$(date -u +%Y%m%d%H%M%S)-$$"
     cp -p "$dest" "$backup"
   fi
   mv -f "$new_bin" "$dest"
   printf -v "$backup_var" '%s' "$backup"
+}
+
+rotate_binary_backups() {
+  local dest="$1"
+  local keep=3
+  local candidates=("$dest".bak-*)
+  if [ "${candidates[0]}" = "$dest.bak-*" ] && [ ! -e "${candidates[0]}" ]; then
+    return 0
+  fi
+  while [ "${#candidates[@]}" -gt "$keep" ]; do
+    local oldest="${candidates[0]}"
+    local candidate
+    for candidate in "${candidates[@]}"; do
+      if [[ "$candidate" < "$oldest" ]]; then
+        oldest="$candidate"
+      fi
+    done
+    rm -f -- "$oldest" || return 1
+    local remaining=()
+    for candidate in "${candidates[@]}"; do
+      [ "$candidate" = "$oldest" ] || remaining+=("$candidate")
+    done
+    candidates=("${remaining[@]}")
+  done
 }
 
 restore_binary_backup() {
@@ -478,7 +551,7 @@ assert_regular_file_or_absent() {
 token_owner_group() {
   case "$GOOS" in
     darwin) printf 'root:wheel' ;;
-    linux) printf 'root:root' ;;
+    linux) printf 'root:%s' "$SERVICE_GROUP" ;;
     *) fail "暂不支持系统: $GOOS" ;;
   esac
 }
@@ -486,7 +559,7 @@ token_owner_group() {
 token_expected_owner_mode() {
   case "$GOOS" in
     darwin) printf '0:0:600' ;;
-    linux) printf '0:0:600' ;;
+    linux) printf '0:%s:640' "$(id -g "$SERVICE_USER")" ;;
     *) fail "暂不支持系统: $GOOS" ;;
   esac
 }
@@ -513,13 +586,96 @@ set_token_owner_mode() {
   local path="$1"
   reject_symlink_path "$path" "token 文件"
   chown "$(token_owner_group)" "$path"
-  chmod 600 "$path"
+  if [ "$GOOS" = "linux" ]; then
+    chmod 640 "$path"
+  else
+    chmod 600 "$path"
+  fi
+}
+
+ensure_linux_service_account() {
+  [ "$GOOS" = "linux" ] || return 0
+  if getent passwd "$SERVICE_USER" >/dev/null; then
+    local passwd_entry passwd_count enumerated_passwd enumerated_passwd_count uid primary_gid home shell uid_min
+    local group_entry group_count enumerated_group enumerated_group_count group_name group_gid group_members
+    local other_primary_users duplicate_gid_group
+    passwd_entry=$(getent passwd "$SERVICE_USER")
+    passwd_count=$(printf '%s\n' "$passwd_entry" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$passwd_count" -eq 1 ] || fail "服务账户 $SERVICE_USER 的 keyed passwd 记录不唯一"
+    enumerated_passwd=$(getent passwd | awk -F: -v user="$SERVICE_USER" '$1 == user')
+    enumerated_passwd_count=$(printf '%s\n' "$enumerated_passwd" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$enumerated_passwd_count" -eq 1 ] && [ "$enumerated_passwd" = "$passwd_entry" ] || fail "服务账户 $SERVICE_USER 的 passwd/NSS 记录不唯一或不一致"
+    IFS=: read -r _ _ uid primary_gid _ home shell <<<"$passwd_entry"
+    [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ne 0 ] || fail "服务账户 $SERVICE_USER 的 UID 无效"
+    uid_min=$(awk '$1 == "UID_MIN" && $2 ~ /^[0-9]+$/ { print $2; exit }' /etc/login.defs 2>/dev/null || true)
+    [[ "$uid_min" =~ ^[0-9]+$ ]] || uid_min=1000
+    [ "$uid" -lt "$uid_min" ] || fail "已有账户 $SERVICE_USER 不是系统账户；请先人工处理同名账户冲突"
+    case "$shell" in
+      /usr/sbin/nologin|/sbin/nologin|/bin/false) ;;
+      *) fail "已有账户 $SERVICE_USER 不是 nologin 系统账户；请先人工处理同名账户冲突" ;;
+    esac
+    [ "$home" = "/nonexistent" ] || fail "已有账户 $SERVICE_USER 的 home 不是 /nonexistent；请先人工处理同名账户冲突"
+
+    group_entry=$(getent group "$SERVICE_USER" || true)
+    [ -n "$group_entry" ] || fail "服务账户 $SERVICE_USER 缺少同名私有主组"
+    group_count=$(printf '%s\n' "$group_entry" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$group_count" -eq 1 ] || fail "服务私有组 $SERVICE_USER 的 keyed group 记录不唯一"
+    enumerated_group=$(getent group | awk -F: -v group="$SERVICE_USER" '$1 == group')
+    enumerated_group_count=$(printf '%s\n' "$enumerated_group" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$enumerated_group_count" -eq 1 ] && [ "$enumerated_group" = "$group_entry" ] || fail "服务私有组 $SERVICE_USER 的 group/NSS 记录不唯一或不一致"
+    IFS=: read -r group_name _ group_gid group_members <<<"$group_entry"
+    [ "$group_name" = "$SERVICE_USER" ] && [ "$group_gid" = "$primary_gid" ] || fail "服务账户 $SERVICE_USER 未使用同名私有主组"
+    if [ -n "$group_members" ]; then
+      local member
+      local -a members=()
+      IFS=, read -ra members <<<"$group_members"
+      for member in "${members[@]}"; do
+        [ -z "$member" ] || [ "$member" = "$SERVICE_USER" ] || fail "服务私有组 $SERVICE_USER 含有其他成员: $member"
+      done
+    fi
+    other_primary_users=$(getent passwd | awk -F: -v gid="$primary_gid" -v user="$SERVICE_USER" '$4 == gid && $1 != user { print $1; exit }')
+    [ -z "$other_primary_users" ] || fail "服务私有组 $SERVICE_USER 被其他账户作为主组使用: $other_primary_users"
+    duplicate_gid_group=$(getent group | awk -F: -v gid="$primary_gid" -v group="$SERVICE_USER" '$3 == gid && $1 != group { print $1; exit }')
+    [ -z "$duplicate_gid_group" ] || fail "服务私有组 $SERVICE_USER 的 GID 被其他组复用: $duplicate_gid_group"
+    SERVICE_GROUP="$SERVICE_USER"
+    return 0
+  fi
+
+  if getent group "$SERVICE_USER" >/dev/null; then
+    fail "检测到没有同名服务账户的既有组 $SERVICE_USER；请先人工处理冲突"
+  fi
+
+  local nologin_shell="/usr/sbin/nologin"
+  [ -x "$nologin_shell" ] || nologin_shell="/sbin/nologin"
+  [ -x "$nologin_shell" ] || fail "未找到 nologin shell，无法安全创建低权限服务账户"
+  if ! useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$SERVICE_USER"; then
+    fail "创建低权限服务账户失败；若 user/group 被部分创建，请人工检查同名账户与组"
+  fi
+  service_account_created=1
+  ensure_linux_service_account
+}
+
+remove_created_linux_service_account() {
+  [ "$GOOS" = "linux" ] || return 0
+  [ "$service_account_created" -eq 1 ] || return 0
+  if getent passwd "$SERVICE_USER" >/dev/null; then
+    userdel "$SERVICE_USER" || return 1
+  fi
+  if getent group "$SERVICE_GROUP" >/dev/null; then
+    groupdel "$SERVICE_GROUP" || return 1
+  fi
+  service_account_created=0
 }
 
 restore_token_backup() {
+  local expected actual
+  expected=$(file_owner_mode "$backup_token")
   restore_file_backup_atomic "$backup_token" "$TOKEN_FILE" "token 文件" || return 1
-  set_token_owner_mode "$TOKEN_FILE" || return 1
-  assert_token_file_secure
+  actual=$(file_owner_mode "$TOKEN_FILE")
+  [ "$actual" = "$expected" ] || {
+    echo "token 文件原始 owner/mode 恢复不完整: $actual，期望 $expected" >&2
+    return 1
+  }
 }
 
 write_token_file() {
@@ -544,8 +700,11 @@ write_token_file() {
 }
 
 install_linux_service() {
-  local backup_bin="$1"
   local exec_start
+  local insecure_args=()
+  if [ "$ALLOW_INSECURE_HTTP" -eq 1 ]; then
+    insecure_args=(-allow-insecure-http)
+  fi
   exec_start=$(systemd_join_args \
     "$BIN" \
     -controller-url "$CONTROLLER_URL" \
@@ -556,6 +715,7 @@ install_linux_service() {
     -host-interval "$HOST_INTERVAL" \
     -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL" \
     -version "$VERSION" \
+    "${insecure_args[@]}" \
     "${extra_args[@]}")
 
   local unit="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -584,6 +744,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
 ExecStart=$exec_start
 Restart=always
 RestartSec=5s
@@ -601,6 +763,7 @@ ProtectKernelLogs=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictNamespaces=true
+RestrictSUIDSGID=true
 SystemCallArchitectures=native
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=CAP_NET_RAW
@@ -622,7 +785,6 @@ EOF_SERVICE
 }
 
 install_macos_service() {
-  local backup_bin="$1"
   local plist="/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist"
   local plist_tmp="${plist}.tmp.$$"
   local plist_backup=""
@@ -647,6 +809,10 @@ install_macos_service() {
 
   local plist_extra_args=""
   local arg
+  if [ "$ALLOW_INSECURE_HTTP" -eq 1 ]; then
+    plist_extra_args="${plist_extra_args}    <string>-allow-insecure-http</string>
+"
+  fi
   for arg in "${extra_args[@]}"; do
     plist_extra_args="${plist_extra_args}    <string>$(xml_escape "$arg")</string>
 "
@@ -700,6 +866,9 @@ EOF_PLIST
 [ -n "$NODE_ID" ] || fail "必须设置 ZENO_NODE_ID"
 [ -z "$TOKEN" ] || [ -z "$ENROLLMENT_TOKEN" ] || fail "ZENO_AGENT_TOKEN 与 ZENO_ENROLLMENT_TOKEN 不能同时设置"
 validate_controller_url "$CONTROLLER_URL"
+if [ "$ALLOW_INSECURE_HTTP" -eq 1 ]; then
+  echo "警告: 远程 Controller 使用 HTTP；enrollment/runtime bearer token 将以明文传输，并会在服务配置中持久化显式 opt-in。" >&2
+fi
 
 need uname
 need sed
@@ -719,6 +888,11 @@ case "$OS" in
   linux)
     GOOS=linux
     need systemctl
+    need getent
+    need id
+    need useradd
+    need userdel
+    need groupdel
     ;;
   darwin)
     GOOS=darwin
@@ -760,6 +934,7 @@ service_enable_state=""
 service_was_enabled=0
 service_was_active=0
 enrollment_token_installed=0
+service_account_created=0
 
 cleanup() {
   local status=$?
@@ -892,6 +1067,14 @@ cleanup() {
   if [ "$status" -eq 0 ] && [ -n "$backup_token" ]; then
     rm -f "$backup_token" 2>/dev/null || true
   fi
+  if [ "$status" -ne 0 ] && [ "$install_committed" -eq 0 ] && [ "$service_account_created" -eq 1 ]; then
+    if [ "$enrollment_token_installed" -eq 1 ]; then
+      echo "enrollment 已提交；保留本次创建的低权限服务账户 $SERVICE_USER 以继续保护新 runtime token" >&2
+    elif ! remove_created_linux_service_account; then
+      echo "移除安装器创建的服务账户/私有组失败，请立即人工检查: $SERVICE_USER" >&2
+      cleanup_status=1
+    fi
+  fi
   rm -rf "$TMP"
   return "$cleanup_status"
 }
@@ -940,6 +1123,7 @@ if [ -n "$DISK_MOUNTS" ]; then
 fi
 
 install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
+ensure_linux_service_account
 assert_regular_file_or_absent "$BIN" "Agent 二进制"
 if [ "$GOOS" = "darwin" ]; then
   assert_regular_file_or_absent "/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist" "LaunchDaemon 配置"
@@ -959,7 +1143,6 @@ if [ -e "$TOKEN_FILE" ]; then
   had_existing_token=1
   backup_token=$(mktemp "$(dirname "$TOKEN_FILE")/.agent-token.backup.XXXXXXXXXX")
   cp -p "$TOKEN_FILE" "$backup_token"
-  set_token_owner_mode "$backup_token"
 fi
 install_started=1
 if [ -n "$ENROLLMENT_TOKEN" ]; then
@@ -986,13 +1169,16 @@ fi
 atomic_install_binary "$FOUND" "$BIN" backup_bin
 
 if [ "$GOOS" = "darwin" ]; then
-  install_macos_service "$backup_bin"
+  install_macos_service
 else
-  install_linux_service "$backup_bin"
+  install_linux_service
 fi
 install_committed=1
 
 if [ -n "$backup_bin" ]; then
+  if ! rotate_binary_backups "$BIN"; then
+    echo "警告: 旧二进制备份轮转失败；请手动仅保留最新 3 份: $BIN.bak-*" >&2
+  fi
   echo "已保留旧二进制: $backup_bin"
 fi
 echo "Zeno Agent 已安装并启动: node=$NODE_ID version=$VERSION"

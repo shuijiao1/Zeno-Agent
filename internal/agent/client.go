@@ -10,15 +10,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Client struct {
-	baseURL string
-	nodeID  string
-	token   string
-	http    *http.Client
+	baseURL           string
+	nodeID            string
+	token             string
+	allowInsecureHTTP bool
+	http              *http.Client
 }
 
 const maxAgentAPIJSONBodyBytes int64 = 1 << 20
@@ -39,11 +41,23 @@ func IsAgentAPIStatus(err error, statusCode int) bool {
 }
 
 func NewClient(baseURL, nodeID, token string) *Client {
+	return NewClientWithOptions(baseURL, nodeID, token, ClientOptions{})
+}
+
+type ClientOptions struct {
+	// AllowInsecureHTTP permits bearer-token transport over plain HTTP only
+	// when the controller host is a direct IP literal with an explicit port.
+	// It never permits HTTP hostnames and must be an explicit operator choice.
+	AllowInsecureHTTP bool
+}
+
+func NewClientWithOptions(baseURL, nodeID, token string, options ClientOptions) *Client {
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		nodeID:  strings.TrimSpace(nodeID),
-		token:   strings.TrimSpace(token),
-		http:    newAgentHTTPClient(),
+		baseURL:           strings.TrimRight(baseURL, "/"),
+		nodeID:            strings.TrimSpace(nodeID),
+		token:             strings.TrimSpace(token),
+		allowInsecureHTTP: options.AllowInsecureHTTP,
+		http:              newAgentHTTPClient(),
 	}
 }
 
@@ -62,6 +76,10 @@ func newAgentHTTPClient() *http.Client {
 }
 
 func ValidateControllerURL(baseURL string) error {
+	return ValidateControllerURLWithOptions(baseURL, false)
+}
+
+func ValidateControllerURLWithOptions(baseURL string, allowInsecureHTTP bool) error {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
 		return fmt.Errorf("invalid controller url")
@@ -79,6 +97,12 @@ func ValidateControllerURL(baseURL string) error {
 		}
 		if address := net.ParseIP(hostname); address != nil && address.IsLoopback() {
 			return nil
+		}
+		if allowInsecureHTTP && net.ParseIP(hostname) != nil {
+			port, portErr := strconv.Atoi(parsed.Port())
+			if portErr == nil && port >= 1 && port <= 65535 {
+				return nil
+			}
 		}
 		return fmt.Errorf("remote controller url must use https")
 	default:
@@ -154,7 +178,7 @@ func commonProbeConfigVersion(rounds []ProbeRound) (int64, error) {
 }
 
 func (c *Client) PresenceWebSocketURL() (string, error) {
-	if err := ValidateControllerURL(c.baseURL); err != nil {
+	if err := ValidateControllerURLWithOptions(c.baseURL, c.allowInsecureHTTP); err != nil {
 		return "", err
 	}
 	parsed, err := url.Parse(c.baseURL)
@@ -184,7 +208,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestValue a
 	if c.baseURL == "" || c.nodeID == "" || c.token == "" {
 		return fmt.Errorf("controller url, node id, and token are required")
 	}
-	if err := ValidateControllerURL(c.baseURL); err != nil {
+	if err := ValidateControllerURLWithOptions(c.baseURL, c.allowInsecureHTTP); err != nil {
 		return err
 	}
 	var body io.Reader
