@@ -389,8 +389,12 @@ function Set-ServiceLogonAccount($Name, $AccountName) {
     throw "unsupported service account: $AccountName"
   }
   $commandLine = 'sc.exe config "{0}" obj= "{1}" password= ""' -f $Name, $AccountName
-  & $env:ComSpec /d /s /c $commandLine | Out-Null
-  return $LASTEXITCODE -eq 0
+  $output = & $env:ComSpec /d /s /c $commandLine 2>&1
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    [Console]::Error.WriteLine("sc.exe 服务账户更新失败 (exit=$exitCode): $($output -join ' ')")
+  }
+  return $exitCode -eq 0
 }
 
 function Test-ServiceLogonAccount($Name, $AccountName) {
