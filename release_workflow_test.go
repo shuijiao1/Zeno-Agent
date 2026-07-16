@@ -64,6 +64,32 @@ func TestReleaseProvenanceAssetMatchesInstallers(t *testing.T) {
 	}
 }
 
+func TestWorkflowsUseNode24JavaScriptActions(t *testing.T) {
+	for _, path := range []string{".github/workflows/ci.yml", ".github/workflows/release.yml"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		workflow := string(content)
+		for _, want := range []string{
+			"actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+			"actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+		} {
+			if !strings.Contains(workflow, want) {
+				t.Fatalf("%s missing Node 24 action pin %q", path, want)
+			}
+		}
+		for _, old := range []string{
+			"actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+			"actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+		} {
+			if strings.Contains(workflow, old) {
+				t.Fatalf("%s still uses Node 20 action pin %q", path, old)
+			}
+		}
+	}
+}
+
 func TestReleasePolicyVersionInjectionVulnerabilityGateAndSBOM(t *testing.T) {
 	workflowBytes, err := os.ReadFile(".github/workflows/release.yml")
 	if err != nil {
