@@ -766,7 +766,9 @@ func TestWindowsVirtualServiceAccountPreservesEmptyPasswordThroughCmd(t *testing
 		`$virtualAccount = "NT SERVICE\$Name"`,
 		"unsupported service account",
 		`password= ""`,
-		"& $env:ComSpec /d /s /c $commandLine",
+		"New-Object Diagnostics.ProcessStartInfo",
+		"System32\\sc.exe",
+		"[Diagnostics.Process]::Start($startInfo)",
 		"$exitCode -eq 0",
 	} {
 		if !strings.Contains(function, want) {

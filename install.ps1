@@ -379,20 +379,29 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
 
 function Set-ServiceLogonAccount($Name, $AccountName) {
   # sc.exe is the supported path for virtual service accounts, but Windows
-  # PowerShell 5.1 drops a directly supplied empty native argument. Pass one
-  # complete command string through cmd.exe so password= "" reaches sc.exe
-  # unchanged. Inputs are deliberately constrained before command construction.
+  # PowerShell 5.1 drops a directly supplied empty native argument. Build the
+  # native command line through ProcessStartInfo so password= "" reaches
+  # sc.exe unchanged. Inputs are constrained before command construction.
   if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { throw "invalid service name: $Name" }
   $virtualAccount = "NT SERVICE\$Name"
   if (-not $AccountName.Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase) -and
       -not $AccountName.Equals($virtualAccount, [StringComparison]::OrdinalIgnoreCase)) {
     throw "unsupported service account: $AccountName"
   }
-  $commandLine = 'sc.exe config "{0}" obj= "{1}" password= ""' -f $Name, $AccountName
-  $output = & $env:ComSpec /d /s /c $commandLine 2>&1
-  $exitCode = $LASTEXITCODE
+  $startInfo = New-Object Diagnostics.ProcessStartInfo
+  $startInfo.FileName = Join-Path $env:SystemRoot 'System32\sc.exe'
+  $startInfo.Arguments = 'config "{0}" obj= "{1}" password= ""' -f $Name, $AccountName
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $process = [Diagnostics.Process]::Start($startInfo)
+  $standardOutput = $process.StandardOutput.ReadToEnd()
+  $standardError = $process.StandardError.ReadToEnd()
+  $process.WaitForExit()
+  $exitCode = $process.ExitCode
   if ($exitCode -ne 0) {
-    [Console]::Error.WriteLine("sc.exe 服务账户更新失败 (exit=$exitCode): $($output -join ' ')")
+    [Console]::Error.WriteLine("sc.exe 服务账户更新失败 (exit=$exitCode): $standardOutput $standardError")
   }
   return $exitCode -eq 0
 }
