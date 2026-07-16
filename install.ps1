@@ -378,17 +378,19 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
 }
 
 function Set-ServiceLogonAccount($Name, $AccountName) {
-  # Win32_Service.Change accepts a real empty string for passwordless virtual
-  # service accounts. Using CIM avoids Windows PowerShell 5.1's native-command
-  # argument reconstruction, which can turn sc.exe's required empty password
-  # into a literal pair of quote characters and make LocalSystem migration fail.
-  $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
-  if (-not $service) { return $false }
-  $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{
-    StartName = $AccountName
-    StartPassword = ''
-  } -ErrorAction Stop
-  return $result -and ([int]$result.ReturnValue -eq 0)
+  # sc.exe is the supported path for virtual service accounts, but Windows
+  # PowerShell 5.1 drops a directly supplied empty native argument. Pass one
+  # complete command string through cmd.exe so password= "" reaches sc.exe
+  # unchanged. Inputs are deliberately constrained before command construction.
+  if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { throw "invalid service name: $Name" }
+  $virtualAccount = "NT SERVICE\$Name"
+  if (-not $AccountName.Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase) -and
+      -not $AccountName.Equals($virtualAccount, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "unsupported service account: $AccountName"
+  }
+  $commandLine = 'sc.exe config "{0}" obj= "{1}" password= ""' -f $Name, $AccountName
+  & $env:ComSpec /d /s /c $commandLine | Out-Null
+  return $LASTEXITCODE -eq 0
 }
 
 function Test-ServiceLogonAccount($Name, $AccountName) {
