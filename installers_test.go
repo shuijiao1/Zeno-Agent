@@ -755,15 +755,25 @@ func TestWindowsEnrollmentRetryReusesProtectedExistingRuntimeToken(t *testing.T)
 	}
 }
 
-func TestWindowsVirtualServiceAccountPreservesEmptyPasswordArgument(t *testing.T) {
+func TestWindowsVirtualServiceAccountUsesCIMWithEmptyPassword(t *testing.T) {
 	scriptBytes, err := os.ReadFile("install.ps1")
 	if err != nil {
 		t.Fatalf("read install.ps1: %v", err)
 	}
 	function := extractPowerShellFunction(t, string(scriptBytes), "Set-ServiceLogonAccount")
-	if !strings.Contains(function, `$emptyPasswordArgument = '""'`) ||
-		!strings.Contains(function, "password= $emptyPasswordArgument") {
-		t.Fatal("Windows service account migration does not preserve sc.exe's required empty password argument")
+	for _, want := range []string{
+		"Get-CimInstance Win32_Service",
+		"Invoke-CimMethod -InputObject $service -MethodName Change",
+		"StartName = $AccountName",
+		"StartPassword = ''",
+		"[int]$result.ReturnValue -eq 0",
+	} {
+		if !strings.Contains(function, want) {
+			t.Fatalf("Windows service account migration missing %q", want)
+		}
+	}
+	if strings.Contains(function, "sc.exe config") {
+		t.Fatal("Windows service account migration still depends on sc.exe empty-argument quoting")
 	}
 }
 

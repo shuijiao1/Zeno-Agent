@@ -378,12 +378,17 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
 }
 
 function Set-ServiceLogonAccount($Name, $AccountName) {
-  # Windows PowerShell 5.1 drops a native empty-string argument. Preserve the
-  # quoted empty password explicitly; virtual service accounts do not have a
-  # password, but sc.exe still requires the value after `password=`.
-  $emptyPasswordArgument = '""'
-  & sc.exe config $Name obj= $AccountName password= $emptyPasswordArgument | Out-Null
-  return $LASTEXITCODE -eq 0
+  # Win32_Service.Change accepts a real empty string for passwordless virtual
+  # service accounts. Using CIM avoids Windows PowerShell 5.1's native-command
+  # argument reconstruction, which can turn sc.exe's required empty password
+  # into a literal pair of quote characters and make LocalSystem migration fail.
+  $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+  if (-not $service) { return $false }
+  $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{
+    StartName = $AccountName
+    StartPassword = ''
+  } -ErrorAction Stop
+  return $result -and ([int]$result.ReturnValue -eq 0)
 }
 
 function Test-ServiceLogonAccount($Name, $AccountName) {

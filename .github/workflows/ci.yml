@@ -58,3 +58,7 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: '[void][scriptblock]::Create((Get-Content -Raw install.ps1))'
+      - name: Verify Windows PowerShell 5.1 virtual service-account migration
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-windows-service-account.ps1
