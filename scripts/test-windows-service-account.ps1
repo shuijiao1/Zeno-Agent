@@ -18,8 +18,9 @@ $functionAst = $ast.Find({
 if (-not $functionAst) { throw 'Set-ServiceLogonAccount not found in install.ps1' }
 Invoke-Expression $functionAst.Extent.Text
 
-$suffix = [Guid]::NewGuid().ToString('N').Substring(0, 12)
-$serviceName = "zeno-agent-ci-$suffix"
+# Use the production service name. Virtual service-account names inherit the
+# service-name component and long synthetic names can be rejected with 1057.
+$serviceName = 'zeno-agent'
 $virtualAccount = "NT SERVICE\$serviceName"
 $created = $false
 try {
