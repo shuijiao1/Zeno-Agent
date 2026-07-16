@@ -1,7 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $installerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'install.ps1'
-$source = Get-Content -Raw -LiteralPath $installerPath
+# Windows PowerShell 5.1 otherwise reads UTF-8-without-BOM as the active ANSI
+# code page, corrupting the installer's Chinese diagnostics before AST parsing.
+$source = Get-Content -Raw -Encoding UTF8 -LiteralPath $installerPath
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
