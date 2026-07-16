@@ -663,15 +663,22 @@ try {
   }
   if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
   if ($CreatedService) {
+    & sc.exe sidtype $ServiceName unrestricted | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
     if (-not (Set-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName")) { Fail 'Zeno Agent 虚拟服务账户配置失败' }
     $ManagedServiceAccount = $true
     Assert-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"
-    & sc.exe sidtype $ServiceName unrestricted | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
     if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges @('SeChangeNotifyPrivilege'))) { Fail 'Zeno Agent 服务权限收敛配置失败' }
     & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务失败恢复策略配置失败' }
   } else {
+    if ($OldServiceSidType -eq 0) {
+      # The NT SERVICE\<name> virtual account is only resolvable after the
+      # service has a SID. Configure it before migrating away from LocalSystem.
+      & sc.exe sidtype $ServiceName unrestricted | Out-Null
+      if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
+      $ServiceSidTypeChanged = $true
+    }
     if ($OldServiceStartName.Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase)) {
       # LocalSystem has no password to recover, so this legacy account can be
       # migrated transactionally. Unknown/custom accounts are deliberately
@@ -685,13 +692,6 @@ try {
       Assert-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"
     } else {
       Write-Warning "保留现有 zeno-agent 自定义服务账户: $OldServiceStartName"
-    }
-    if ($OldServiceSidType -eq 0) {
-      # Existing restricted services already expose a usable service SID; do
-      # not weaken that policy. Only SERVICE_SID_TYPE_NONE must be upgraded.
-      & sc.exe sidtype $ServiceName unrestricted | Out-Null
-      if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
-      $ServiceSidTypeChanged = $true
     }
     if ($ManagedServiceAccount -and ((@($OldServiceRequiredPrivileges) -join '/') -ne 'SeChangeNotifyPrivilege')) {
       if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges @('SeChangeNotifyPrivilege'))) { Fail 'Zeno Agent 服务权限收敛配置失败' }
@@ -776,11 +776,6 @@ try {
       [Console]::Error.WriteLine("旧服务 binPath 恢复失败: $_")
     }
   }
-  if ($ServiceSidTypeChanged -and $null -ne $OldServiceSidType -and -not $CreatedService) {
-    $restoreSidType = Convert-ServiceSidTypeToScValue -SidType $OldServiceSidType
-    & sc.exe sidtype $ServiceName $restoreSidType | Out-Null
-    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("旧服务 SID 策略恢复失败: $restoreSidType") }
-  }
   if ($ServiceRequiredPrivilegesChanged -and -not $CreatedService) {
     try {
       if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges $OldServiceRequiredPrivileges)) {
@@ -804,6 +799,14 @@ try {
     } catch {
       [Console]::Error.WriteLine("旧服务账户恢复验证失败: $OldServiceStartName；错误: $_")
     }
+  }
+  if ($ServiceSidTypeChanged -and $null -ne $OldServiceSidType -and -not $CreatedService) {
+    # Keep the service SID available until a migrated virtual account has been
+    # restored to LocalSystem; disabling it first makes the virtual identity
+    # unresolvable on Windows PowerShell 5.1 hosts.
+    $restoreSidType = Convert-ServiceSidTypeToScValue -SidType $OldServiceSidType
+    & sc.exe sidtype $ServiceName $restoreSidType | Out-Null
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("旧服务 SID 策略恢复失败: $restoreSidType") }
   }
   if ($Existing -and -not $CreatedService -and $null -ne $OldServiceStart) {
     $restoreStartMode = Convert-ServiceStartPolicyToScValue -Start $OldServiceStart -DelayedAutoStart $OldDelayedAutoStart

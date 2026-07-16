@@ -777,6 +777,32 @@ func TestWindowsVirtualServiceAccountUsesCIMWithEmptyPassword(t *testing.T) {
 	}
 }
 
+func TestWindowsInstallerKeepsServiceSIDAvailableDuringAccountMigrationAndRollback(t *testing.T) {
+	scriptBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	script := string(scriptBytes)
+
+	createdSID := strings.Index(script, "& sc.exe sidtype $ServiceName unrestricted")
+	createdAccount := strings.Index(script, `Set-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"`)
+	if createdSID < 0 || createdAccount < 0 || createdSID > createdAccount {
+		t.Fatal("fresh Windows install must enable the service SID before assigning the virtual account")
+	}
+
+	existingSID := strings.Index(script, "if ($OldServiceSidType -eq 0) {")
+	existingAccount := strings.Index(script, "if ($OldServiceStartName.Equals('LocalSystem'")
+	if existingSID < 0 || existingAccount < 0 || existingSID > existingAccount {
+		t.Fatal("Windows upgrade must enable the service SID before migrating LocalSystem")
+	}
+
+	rollbackAccount := strings.LastIndex(script, "if ($ServiceAccountChanged")
+	rollbackSID := strings.LastIndex(script, "if ($ServiceSidTypeChanged")
+	if rollbackAccount < 0 || rollbackSID < 0 || rollbackAccount > rollbackSID {
+		t.Fatal("Windows rollback must restore LocalSystem before disabling the service SID")
+	}
+}
+
 func extractPowerShellFunction(t *testing.T, script, name string) string {
 	t.Helper()
 	start := strings.Index(script, "function "+name+"(")

@@ -31,6 +31,8 @@ try {
     throw "unexpected initial service account: $($before.StartName)"
   }
 
+  & sc.exe sidtype $serviceName unrestricted | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'failed to enable the test service SID' }
   if (-not (Set-ServiceLogonAccount -Name $serviceName -AccountName $virtualAccount)) {
     throw 'LocalSystem to virtual-account migration returned failure'
   }
@@ -46,6 +48,8 @@ try {
   if (-not ([string]$restored.StartName).Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase)) {
     throw "LocalSystem rollback did not persist: $($restored.StartName)"
   }
+  & sc.exe sidtype $serviceName none | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'failed to restore the test service SID policy' }
 } finally {
   if ($created) {
     & sc.exe delete $serviceName | Out-Null
