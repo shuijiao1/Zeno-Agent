@@ -378,10 +378,10 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
 }
 
 function Set-ServiceLogonAccount($Name, $AccountName) {
-  # sc.exe is the supported path for virtual service accounts, but Windows
-  # PowerShell 5.1 drops a directly supplied empty native argument. Build the
-  # native command line through ProcessStartInfo so password= "" reaches
-  # sc.exe unchanged. Inputs are constrained before command construction.
+  # Virtual service accounts are configured without a password argument.
+  # Passing password= "" can be rejected with ERROR_INVALID_SERVICE_ACCOUNT
+  # (1057), even though the account itself is valid. ProcessStartInfo keeps the
+  # remaining quoted account name independent of PowerShell 5.1 native parsing.
   if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { throw "invalid service name: $Name" }
   $virtualAccount = "NT SERVICE\$Name"
   if (-not $AccountName.Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase) -and
@@ -390,7 +390,7 @@ function Set-ServiceLogonAccount($Name, $AccountName) {
   }
   $startInfo = New-Object Diagnostics.ProcessStartInfo
   $startInfo.FileName = Join-Path $env:SystemRoot 'System32\sc.exe'
-  $startInfo.Arguments = 'config "{0}" obj= "{1}" password= ""' -f $Name, $AccountName
+  $startInfo.Arguments = 'config "{0}" obj= "{1}"' -f $Name, $AccountName
   $startInfo.UseShellExecute = $false
   $startInfo.CreateNoWindow = $true
   $startInfo.RedirectStandardOutput = $true

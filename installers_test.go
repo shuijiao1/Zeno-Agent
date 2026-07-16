@@ -755,7 +755,7 @@ func TestWindowsEnrollmentRetryReusesProtectedExistingRuntimeToken(t *testing.T)
 	}
 }
 
-func TestWindowsVirtualServiceAccountPreservesEmptyPasswordThroughCmd(t *testing.T) {
+func TestWindowsVirtualServiceAccountOmitsPasswordArgument(t *testing.T) {
 	scriptBytes, err := os.ReadFile("install.ps1")
 	if err != nil {
 		t.Fatalf("read install.ps1: %v", err)
@@ -765,7 +765,6 @@ func TestWindowsVirtualServiceAccountPreservesEmptyPasswordThroughCmd(t *testing
 		"$Name -notmatch '^[A-Za-z0-9_.-]+$'",
 		`$virtualAccount = "NT SERVICE\$Name"`,
 		"unsupported service account",
-		`password= ""`,
 		"New-Object Diagnostics.ProcessStartInfo",
 		"System32\\sc.exe",
 		"[Diagnostics.Process]::Start($startInfo)",
@@ -777,6 +776,9 @@ func TestWindowsVirtualServiceAccountPreservesEmptyPasswordThroughCmd(t *testing
 	}
 	if strings.Contains(function, "& sc.exe config") {
 		t.Fatal("Windows service account migration still invokes sc.exe directly through PowerShell 5.1")
+	}
+	if strings.Contains(function, `obj= "{1}" password=`) {
+		t.Fatal("Windows virtual service-account migration must not pass a password argument")
 	}
 }
 
