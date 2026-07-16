@@ -378,7 +378,11 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
 }
 
 function Set-ServiceLogonAccount($Name, $AccountName) {
-  & sc.exe config $Name obj= $AccountName password= "" | Out-Null
+  # Windows PowerShell 5.1 drops a native empty-string argument. Preserve the
+  # quoted empty password explicitly; virtual service accounts do not have a
+  # password, but sc.exe still requires the value after `password=`.
+  $emptyPasswordArgument = '""'
+  & sc.exe config $Name obj= $AccountName password= $emptyPasswordArgument | Out-Null
   return $LASTEXITCODE -eq 0
 }
 
@@ -590,14 +594,33 @@ try {
     }
   }
   if ($EnrollmentToken) {
-    # Persist the generated runtime token before consuming the one-time
-    # enrollment credential. Once exchange succeeds this token is the only
-    # recoverable credential on a fresh install, so every later rollback must
-    # preserve its contents even if SCM/ACL setup subsequently fails.
-    Invoke-AgentEnrollment -RuntimeToken $Token
-    $EnrollmentExchangeSucceeded = $true
-    $EnrollmentTokenInstalled = $true
-    $EnrollmentToken = $null
+    try {
+      # Persist the generated runtime token before consuming the one-time
+      # enrollment credential. Once exchange succeeds this token is the only
+      # recoverable credential on a fresh install, so every later rollback must
+      # preserve its contents even if SCM/ACL setup subsequently fails.
+      Invoke-AgentEnrollment -RuntimeToken $Token
+      $EnrollmentExchangeSucceeded = $true
+      $EnrollmentTokenInstalled = $true
+      $EnrollmentToken = $null
+    } catch {
+      $enrollmentError = $_
+      if (-not ($HadExistingToken -and $BackupToken -and (Test-Path -LiteralPath $BackupToken -PathType Leaf))) {
+        throw
+      }
+      try {
+        # A prior attempt can successfully exchange the one-time credential,
+        # then fail during a later transactional SCM/ACL step. In that case the
+        # protected existing token is already authoritative and the same copied
+        # install command must be safely retryable without another enrollment.
+        Restore-TokenBackup -Backup $BackupToken -Destination $TokenFile -OldAcl $OldTokenAcl
+        $Token = $null
+        $EnrollmentToken = $null
+        Write-Warning '一次性 enrollment token 已失效；将验证并复用现有 runtime token 继续升级。'
+      } catch {
+        throw $enrollmentError
+      }
+    }
   }
 
   $Args = @(

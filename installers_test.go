@@ -731,6 +731,66 @@ func TestWindowsEnrollmentExchangeCommitsPendingTokenBeforeSCMChanges(t *testing
 	}
 }
 
+func TestWindowsEnrollmentRetryReusesProtectedExistingRuntimeToken(t *testing.T) {
+	scriptBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	script := string(scriptBytes)
+	exchange := strings.Index(script, "Invoke-AgentEnrollment -RuntimeToken $Token")
+	restore := strings.Index(script, "Restore-TokenBackup -Backup $BackupToken -Destination $TokenFile -OldAcl $OldTokenAcl")
+	check := strings.Index(script, "$CheckArgs = @($Args) + @('-install-check')")
+	if exchange < 0 || restore < 0 || check < 0 || !(exchange < restore && restore < check) {
+		t.Fatal("Windows enrollment retry must restore the protected existing token before install-check")
+	}
+	for _, want := range []string{
+		"$HadExistingToken -and $BackupToken",
+		"$Token = $null",
+		"$EnrollmentToken = $null",
+		"将验证并复用现有 runtime token 继续升级",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Windows enrollment retry missing %q", want)
+		}
+	}
+}
+
+func TestWindowsVirtualServiceAccountPreservesEmptyPasswordArgument(t *testing.T) {
+	scriptBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	function := extractPowerShellFunction(t, string(scriptBytes), "Set-ServiceLogonAccount")
+	if !strings.Contains(function, `$emptyPasswordArgument = '""'`) ||
+		!strings.Contains(function, "password= $emptyPasswordArgument") {
+		t.Fatal("Windows service account migration does not preserve sc.exe's required empty password argument")
+	}
+}
+
+func extractPowerShellFunction(t *testing.T, script, name string) string {
+	t.Helper()
+	start := strings.Index(script, "function "+name+"(")
+	if start < 0 {
+		t.Fatalf("missing PowerShell function %s", name)
+	}
+	depth := 0
+	seenBody := false
+	for i := start; i < len(script); i++ {
+		switch script[i] {
+		case '{':
+			depth++
+			seenBody = true
+		case '}':
+			depth--
+			if seenBody && depth == 0 {
+				return script[start : i+1]
+			}
+		}
+	}
+	t.Fatalf("unterminated PowerShell function %s", name)
+	return ""
+}
+
 func extractShellFunction(t *testing.T, script, name string) string {
 	t.Helper()
 	start := strings.Index(script, name+"() {")
