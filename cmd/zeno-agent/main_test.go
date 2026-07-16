@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,92 @@ func TestDefaultReportIntervalsAreSplitByPurpose(t *testing.T) {
 	}
 	if defaultIdentityRefreshInterval != 12*time.Hour {
 		t.Fatalf("default identity refresh interval = %s, want 12h", defaultIdentityRefreshInterval)
+	}
+}
+
+func TestInstallCheckRequiresHeartbeatAndStateAcceptance(t *testing.T) {
+	const token = "install-check-secret"
+	for _, tc := range []struct {
+		name            string
+		heartbeatStatus int
+		stateStatus     int
+		wantError       bool
+	}{
+		{name: "both accepted", heartbeatStatus: http.StatusAccepted, stateStatus: http.StatusNoContent},
+		{name: "heartbeat rejected", heartbeatStatus: http.StatusUnauthorized, stateStatus: http.StatusNoContent, wantError: true},
+		{name: "state rejected", heartbeatStatus: http.StatusAccepted, stateStatus: http.StatusInternalServerError, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var heartbeatPosts atomic.Int64
+			var statePosts atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Node-ID") != "install-node" || r.Header.Get("Authorization") != "Bearer "+token {
+					t.Errorf("unexpected install check authentication headers")
+				}
+				switch r.URL.Path {
+				case "/api/agent/v1/heartbeat":
+					heartbeatPosts.Add(1)
+					w.WriteHeader(tc.heartbeatStatus)
+				case "/api/agent/v1/state":
+					statePosts.Add(1)
+					w.WriteHeader(tc.stateStatus)
+					_, _ = w.Write([]byte("controller response must stay private: " + token))
+				default:
+					t.Errorf("install check unexpectedly requested %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			err := run(context.Background(), config{
+				ControllerURL:     server.URL,
+				NodeID:            "install-node",
+				Token:             token,
+				Version:           "install-check-test",
+				InstallCheck:      true,
+				StateInterval:     time.Second,
+				HeartbeatInterval: time.Second,
+			})
+			if tc.wantError && err == nil {
+				t.Fatal("install check succeeded after controller rejection")
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("install check failed: %v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), token) {
+				t.Fatalf("install check error leaked token or response body: %v", err)
+			}
+			if got := heartbeatPosts.Load(); got != 1 {
+				t.Fatalf("heartbeat posts = %d, want 1", got)
+			}
+			wantStatePosts := int64(1)
+			if tc.heartbeatStatus < 200 || tc.heartbeatStatus >= 300 {
+				wantStatePosts = 0
+			}
+			if got := statePosts.Load(); got != wantStatePosts {
+				t.Fatalf("state posts = %d, want %d", got, wantStatePosts)
+			}
+		})
+	}
+}
+
+func TestInstallCheckRejectsUntrustedTLS(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	err := run(context.Background(), config{
+		ControllerURL: server.URL,
+		NodeID:        "install-node",
+		Token:         "tls-check-secret",
+		Version:       "install-check-test",
+		InstallCheck:  true,
+	})
+	if err == nil {
+		t.Fatal("install check accepted an untrusted Controller certificate")
+	}
+	if strings.Contains(err.Error(), "tls-check-secret") {
+		t.Fatalf("TLS install-check error leaked token: %v", err)
 	}
 }
 

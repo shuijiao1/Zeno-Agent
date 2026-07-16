@@ -47,10 +47,11 @@ type StateSample struct {
 	// NetTotalsValid distinguishes a real zero counter from a failed platform
 	// read. It is an optional, additive field so older Controllers can continue
 	// consuming the existing total/speed fields unchanged.
-	NetTotalsValid     *bool `json:"net_totals_valid,omitempty"`
-	ProcessCount       int64 `json:"process_count"`
-	TCPConnectionCount int64 `json:"tcp_connection_count"`
-	UDPConnectionCount int64 `json:"udp_connection_count"`
+	NetTotalsValid     *bool  `json:"net_totals_valid,omitempty"`
+	NetCounterSource   string `json:"net_counter_source,omitempty"`
+	ProcessCount       int64  `json:"process_count"`
+	TCPConnectionCount int64  `json:"tcp_connection_count"`
+	UDPConnectionCount int64  `json:"udp_connection_count"`
 	// ConnectionCountsValid has the same compatibility semantics as
 	// NetTotalsValid. On a failed read the numeric fields contain the last known
 	// values (when available), never a fabricated fresh zero.

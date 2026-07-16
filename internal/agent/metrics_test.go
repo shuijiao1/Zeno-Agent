@@ -142,6 +142,19 @@ func TestParseLinuxNetworkTotalsReturnsErrorsInsteadOfZero(t *testing.T) {
 	}
 }
 
+func TestNetworkCounterSourceTracksSelectedInterfaces(t *testing.T) {
+	first := networkCounterSourceID([]string{"eth1", "eth0"})
+	if first == "" || first != networkCounterSourceID([]string{"eth0", "eth1"}) {
+		t.Fatalf("counter source is empty or order-dependent: %q", first)
+	}
+	if first == networkCounterSourceID([]string{"eth0"}) {
+		t.Fatal("counter source did not change when the selected interface set changed")
+	}
+	if networkCounterSourceID(nil) != "" {
+		t.Fatal("empty selected interface set should not claim a source identity")
+	}
+}
+
 func TestCollectStateKeepsValidNetworkBaselineAcrossReadFailure(t *testing.T) {
 	collector := NewMetricsCollector()
 	networkReads := 0
@@ -195,6 +208,28 @@ func TestCollectStateKeepsValidNetworkBaselineAcrossReadFailure(t *testing.T) {
 	}
 	if recovered.ConnectionCountsValid == nil || !*recovered.ConnectionCountsValid || recovered.TCPConnectionCount == failed.TCPConnectionCount {
 		t.Fatalf("recovered connection sample = %+v, want refreshed valid counts", recovered)
+	}
+}
+
+func TestCollectStateRebasesSpeedWhenCounterSourceChanges(t *testing.T) {
+	collector := NewMetricsCollector()
+	reads := 0
+	collector.networkReader = func(map[string]struct{}) (networkTotals, error) {
+		reads++
+		if reads == 1 {
+			return networkTotals{InBytes: 100, OutBytes: 200, SourceNames: []string{"eth0"}}, nil
+		}
+		return networkTotals{InBytes: 10000, OutBytes: 20000, SourceNames: []string{"eth0", "eth1"}}, nil
+	}
+	collector.connectionReader = func() (int64, int64, error) { return 0, 0, nil }
+	start := time.Unix(1782990000, 0)
+	first := collector.CollectState(start)
+	changed := collector.CollectState(start.Add(time.Second))
+	if first.NetCounterSource == "" || changed.NetCounterSource == "" || first.NetCounterSource == changed.NetCounterSource {
+		t.Fatalf("counter source did not identify topology change: %q -> %q", first.NetCounterSource, changed.NetCounterSource)
+	}
+	if changed.NetInSpeedBps != 0 || changed.NetOutSpeedBps != 0 {
+		t.Fatalf("source change produced a synthetic speed spike: %v/%v", changed.NetInSpeedBps, changed.NetOutSpeedBps)
 	}
 }
 

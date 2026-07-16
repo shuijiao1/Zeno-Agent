@@ -1,6 +1,7 @@
 package zenoagent_test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -30,6 +31,17 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"reject_symlink_path \"$TOKEN_FILE\" \"token 文件\"",
 		"token_owner_group()",
 		"ensure_linux_service_account()",
+		"ensure_macos_service_account()",
+		"validate_macos_service_account()",
+		"find_available_macos_system_id()",
+		`SERVICE_USER="_zeno-agent"`,
+		`SERVICE_GROUP="_zeno-agent"`,
+		`dscl . -create "$user_record"`,
+		`dscl . -delete "/Users/$SERVICE_USER"`,
+		`darwin|linux) printf '0:%s:640'`,
+		`<key>UserName</key><string>$(xml_escape "$SERVICE_USER")</string>`,
+		"prepare_macos_service",
+		"restore_token_metadata_from_backup",
 		"useradd --system --user-group --no-create-home",
 		"service_account_created=1",
 		"remove_created_linux_service_account",
@@ -47,7 +59,7 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"if [ \"$service_was_active\" -eq 1 ]; then",
 		"$dest.bak-$(date -u +%Y%m%d%H%M%S)-$$",
 		"chown root:root \"$unit\"",
-		"chown root:wheel \"$plist\"",
+		"chown root:wheel \"$plist_tmp\"",
 		"plutil -lint \"$plist_tmp\"",
 		"NoNewPrivileges=true",
 		"User=$SERVICE_USER",
@@ -61,8 +73,21 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 		"RestrictNamespaces=true",
 		"RestrictSUIDSGID=true",
 		"MemoryDenyWriteExecute=true",
+		"KillSignal=SIGTERM",
+		"KillMode=control-group",
+		"TimeoutStopSec=30s",
+		"SendSIGKILL=yes",
 		"ProcessType</key><string>Background",
+		"<key>ExitTimeOut</key><integer>30</integer>",
 		"<key>Umask</key><integer>63</integer>",
+		"run_agent_install_check",
+		"-install-check",
+		"prepare_macos_logging",
+		"install_macos_logging",
+		"restore_macos_logging",
+		"# Managed by Zeno Agent installer",
+		"newsyslog -n -f",
+		"-log-file</string><string>$(xml_escape \"$MACOS_LOG_FILE\")",
 		"validate_controller_url",
 		"insecure_args=(-allow-insecure-http)",
 		"<string>-allow-insecure-http</string>",
@@ -86,6 +111,246 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 	}
 	if strings.Contains(script, "[ \"$service_config_existed\" -eq 1 ] && [ \"$service_was_active\" -eq 1 ]") {
 		t.Fatalf("install.sh still gates active-state restoration on /etc unit existence")
+	}
+	if strings.Contains(script, "ExecStop=") {
+		t.Fatalf("install.sh adds a redundant ExecStop instead of using systemd native SIGTERM handling")
+	}
+	if strings.Contains(script, "<key>StandardOutPath</key>") || strings.Contains(script, "<key>StandardErrorPath</key>") {
+		t.Fatalf("macOS service still relies on non-reopenable launchd stdout/stderr log descriptors")
+	}
+}
+
+func TestInstallCheckRunsBeforeServiceMutationAndNeverPersists(t *testing.T) {
+	unixBytes, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unix := string(unixBytes)
+	transaction := strings.LastIndex(unix, `if [ -n "$ENROLLMENT_TOKEN" ]; then`)
+	if transaction < 0 {
+		t.Fatal("Unix enrollment transaction missing")
+	}
+	unixMain := unix[transaction:]
+	atomicInstall := strings.Index(unixMain, `atomic_install_binary "$FOUND" "$BIN" backup_bin`)
+	check := strings.Index(unixMain, "run_agent_install_check")
+	linuxMutation := strings.Index(unixMain, "install_linux_service")
+	macMutation := strings.Index(unixMain, "install_macos_service")
+	commit := strings.Index(unixMain, "install_committed=1")
+	if atomicInstall < 0 || check < 0 || linuxMutation < 0 || macMutation < 0 || commit < 0 ||
+		!(atomicInstall < check && check < linuxMutation && linuxMutation < commit && check < macMutation && macMutation < commit) {
+		t.Fatalf("Unix install-check ordering is not transactional")
+	}
+	checkFunction := extractShellFunction(t, unix, "run_agent_install_check")
+	if !strings.Contains(checkFunction, `-token-file "$TOKEN_FILE"`) || strings.Contains(checkFunction, `-token "$TOKEN"`) {
+		t.Fatal("Unix install check must use token-file and never put the token in argv")
+	}
+	linuxService := extractShellFunction(t, unix, "install_linux_service")
+	macService := extractShellFunction(t, unix, "install_macos_service")
+	if strings.Contains(linuxService, "-install-check") || strings.Contains(macService, "-install-check") {
+		t.Fatal("Unix service configuration persisted the one-shot install-check flag")
+	}
+
+	windowsBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows := string(windowsBytes)
+	exchange := strings.Index(windows, "Invoke-AgentEnrollment -RuntimeToken $Token")
+	check = strings.Index(windows, "$CheckArgs = @($Args) + @('-install-check')")
+	mutation := strings.Index(windows, "$BinPath = Join-WindowsCommandLine")
+	commit = strings.Index(windows, "$InstallSucceeded = $true")
+	if exchange < 0 || check < 0 || mutation < 0 || commit < 0 || !(exchange < check && check < mutation && mutation < commit) {
+		t.Fatal("Windows install-check ordering is not transactional")
+	}
+	if !strings.Contains(windows, "& $Bin @CheckArgs") {
+		t.Fatal("Windows install check does not use a PowerShell argument array")
+	}
+}
+
+func TestMacOSExistingServiceAccountMustBePrivateNoLoginSystemAccount(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	script := string(content)
+	base := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "darwin_scalar_attribute") + "\n" +
+		extractShellFunction(t, script, "darwin_attribute_values") + "\n" +
+		extractShellFunction(t, script, "validate_macos_service_account") + "\n" +
+		`GOOS=darwin
+SERVICE_USER=_zeno-agent
+SERVICE_GROUP=_zeno-agent
+dscl() {
+  [ "$1" = . ] || return 2
+  shift
+  if [ "$1" = -read ]; then
+    local record="$2" attribute="${3-}"
+    case "$record:$attribute" in
+      /Users/_zeno-agent:) return 0 ;;
+      /Groups/_zeno-agent:) return 0 ;;
+      /Users/_zeno-agent:UniqueID) printf 'UniqueID: 499\n' ;;
+      /Users/_zeno-agent:PrimaryGroupID) printf 'PrimaryGroupID: 499\n' ;;
+      /Users/_zeno-agent:NFSHomeDirectory) printf 'NFSHomeDirectory: /var/empty\n' ;;
+      /Users/_zeno-agent:UserShell) printf 'UserShell: %s\n' "$MOCK_SHELL" ;;
+      /Users/_zeno-agent:Password) printf 'Password: ********\n' ;;
+      /Groups/_zeno-agent:PrimaryGroupID) printf 'PrimaryGroupID: 499\n' ;;
+      /Groups/_zeno-agent:GroupMembership)
+        [ -n "$MOCK_MEMBER" ] || return 1
+        printf 'GroupMembership: %s\n' "$MOCK_MEMBER"
+        ;;
+      /Groups/_zeno-agent:GroupMembers) return 1 ;;
+      *) return 2 ;;
+    esac
+    return 0
+  fi
+  if [ "$1" = -list ] && [ "$2:$3" = /Users:UniqueID ]; then
+    printf 'root 0\n_zeno-agent 499\n'
+    return 0
+  fi
+  if [ "$1" = -list ] && [ "$2:$3" = /Users:PrimaryGroupID ]; then
+    printf 'root 0\n_zeno-agent 499\n'
+    return 0
+  fi
+  if [ "$1" = -list ] && [ "$2:$3" = /Groups:PrimaryGroupID ]; then
+    printf 'wheel 0\n_zeno-agent 499\n'
+    return 0
+  fi
+  return 2
+}
+
+validate_macos_service_account
+`
+
+	for _, tc := range []struct {
+		name      string
+		shell     string
+		member    string
+		wantError bool
+	}{
+		{name: "private no-login account", shell: "/usr/bin/false"},
+		{name: "interactive shell", shell: "/bin/zsh", wantError: true},
+		{name: "foreign group member", shell: "/usr/bin/false", member: "other", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("bash", "-c", base)
+			cmd.Env = append(os.Environ(), "MOCK_SHELL="+tc.shell, "MOCK_MEMBER="+tc.member)
+			out, err := cmd.CombinedOutput()
+			if tc.wantError && err == nil {
+				t.Fatalf("unsafe macOS service account was accepted: %s", out)
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("safe macOS service account rejected: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestMacOSNewsyslogConfigRefusesUnmanagedCollision(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	fragment := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "reject_symlink_path") + "\n" +
+		extractShellFunction(t, script, "assert_regular_file_or_absent") + "\n" +
+		extractShellFunction(t, script, "file_owner_mode") + "\n" +
+		extractShellFunction(t, script, "prepare_macos_logging") + "\n" +
+		`MACOS_LOG_FILE="$1/zeno-agent.log"
+MACOS_NEWSYSLOG_CONFIG="$1/zeno-agent.conf"
+MACOS_NEWSYSLOG_MARKER="# Managed by Zeno Agent installer"
+TMP="$1/tmp"
+mkdir -p "$TMP"
+macos_newsyslog_config_existed=0
+macos_newsyslog_config_backup=""
+macos_log_existed=0
+macos_log_old_metadata=""
+prepare_macos_logging
+`
+
+	for _, tc := range []struct {
+		name      string
+		config    string
+		wantError bool
+	}{
+		{name: "managed", config: "# Managed by Zeno Agent installer\n/var/log/zeno-agent.log _zeno-agent:_zeno-agent 600 7 1024 * N\n"},
+		{name: "unmanaged", config: "/var/log/zeno-agent.log root:wheel 600 3 1024 * N\n", wantError: true},
+		{name: "marker not first", config: "/var/log/custom.log root:wheel 600 3 1024 * N\n# Managed by Zeno Agent installer\n", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(dir+"/zeno-agent.conf", []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out, err := exec.Command("bash", "-c", fragment, "bash", dir).CombinedOutput()
+			if tc.wantError && err == nil {
+				t.Fatalf("unmanaged config was accepted: %s", out)
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("managed config was rejected: %v\n%s", err, out)
+			}
+			if tc.wantError {
+				got, readErr := os.ReadFile(dir + "/zeno-agent.conf")
+				if readErr != nil || string(got) != tc.config {
+					t.Fatalf("unmanaged config was modified: %q, %v", got, readErr)
+				}
+			}
+		})
+	}
+}
+
+func TestMacOSLoggingRollbackRestoresConfigWithoutOverwritingLog(t *testing.T) {
+	content, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	dir := t.TempDir()
+	config := dir + "/zeno-agent.conf"
+	backup := dir + "/zeno-agent.conf.backup"
+	logPath := dir + "/zeno-agent.log"
+	oldConfig := "# Managed by Zeno Agent installer\nold policy\n"
+	if err := os.WriteFile(backup, []byte(oldConfig), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("new policy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("existing log\nnew install log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	metadata := fmt.Sprintf("%d:%d:600", stat.Uid, stat.Gid)
+	fragment := extractShellFunction(t, script, "fail") + "\n" +
+		extractShellFunction(t, script, "restore_file_backup_atomic") + "\n" +
+		extractShellFunction(t, script, "file_owner_mode") + "\n" +
+		extractShellFunction(t, script, "restore_macos_logging") + "\n" +
+		`chown() { :; }
+GOOS=linux
+MACOS_NEWSYSLOG_CONFIG="$1"
+macos_newsyslog_config_backup="$2"
+MACOS_LOG_FILE="$3"
+macos_log_old_metadata="$4"
+macos_logging_installed=1
+macos_newsyslog_config_existed=1
+macos_log_created=0
+macos_log_existed=1
+restore_macos_logging
+`
+	if out, err := exec.Command("bash", "-c", fragment, "bash", config, backup, logPath, metadata).CombinedOutput(); err != nil {
+		t.Fatalf("restore_macos_logging: %v\n%s", err, out)
+	}
+	gotConfig, err := os.ReadFile(config)
+	if err != nil || string(gotConfig) != oldConfig {
+		t.Fatalf("restored config = %q, %v", gotConfig, err)
+	}
+	gotLog, err := os.ReadFile(logPath)
+	if err != nil || string(gotLog) != "existing log\nnew install log\n" {
+		t.Fatalf("rollback overwrote existing log = %q, %v", gotLog, err)
 	}
 }
 
@@ -330,9 +595,13 @@ func TestUnixControllerURLValidation(t *testing.T) {
 		}
 	}
 	for _, value := range []string{"http://203.0.113.10:80", "http://203.0.113.10:18980", "http://[::ffff:192.168.1.1]:18980", "http://[::ffff:8000:1]:18980", "http://[2001:db8::10]:18980"} {
-		cmd := exec.Command("bash", "-c", "ALLOW_INSECURE_HTTP=0\n"+fragment+"validate_controller_url \"$1\" && [ \"$ALLOW_INSECURE_HTTP\" -eq 1 ]", "bash", value)
+		cmd := exec.Command("bash", "-c", "ALLOW_INSECURE_HTTP=0\nALLOW_INSECURE_HTTP_REQUESTED=1\n"+fragment+"validate_controller_url \"$1\" && [ \"$ALLOW_INSECURE_HTTP\" -eq 1 ]", "bash", value)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("validate_controller_url did not require explicit runtime opt-in for %q: %v\n%s", value, err, out)
+		}
+		cmd = exec.Command("bash", "-c", "ALLOW_INSECURE_HTTP=0\nALLOW_INSECURE_HTTP_REQUESTED=0\n"+fragment+"validate_controller_url \"$1\"", "bash", value)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("validate_controller_url accepted plaintext remote URL without explicit installer opt-in for %q\n%s", value, out)
 		}
 	}
 	for _, value := range []string{
@@ -391,7 +660,13 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"Set-Acl -Path $Destination -AclObject $OldAcl",
 		"$OldServiceStart",
 		"$OldServiceSidType",
+		"$OldServiceStartName",
+		"$OldServiceRequiredPrivileges",
+		"$ServiceAccountChanged",
+		"$ServiceRequiredPrivilegesChanged",
 		"Get-ServiceRegistryPolicy",
+		"Set-ServiceLogonAccount",
+		"Set-ServiceRequiredPrivileges",
 		"Convert-ServiceStartPolicyToScValue",
 		"Convert-ServiceSidTypeToScValue",
 		"$OldServiceWasRunning",
@@ -403,8 +678,11 @@ func TestWindowsInstallerEnforcesChecksumsStrictTokenAclAndRollback(t *testing.T
 		"$RecoveryBackupPath",
 		"zeno-agent.exe.rollback-",
 		"sc.exe sidtype",
-		"sc.exe config $ServiceName obj= \"NT SERVICE\\$ServiceName\"",
-		"sc.exe privs $ServiceName SeChangeNotifyPrivilege",
+		"$OldServiceStartName.Equals('LocalSystem'",
+		`Set-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"`,
+		"保留现有 zeno-agent 自定义服务账户",
+		"旧服务账户恢复失败",
+		"旧服务最小权限列表恢复失败",
 		"拒绝覆盖现有二进制",
 		"原备份仍保留在",
 		"token 文件恢复失败，备份仍保留在",

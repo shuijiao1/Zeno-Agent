@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -459,7 +461,7 @@ func TestProbeHostnamePolicyAllowsPrivateAndCGNATTargets(t *testing.T) {
 	}
 }
 
-func TestProbeHostnamePolicyRejectsLocalhostName(t *testing.T) {
+func TestProbeHostnamePolicyAllowsOnlyLoopbackForLocalhostName(t *testing.T) {
 	lookup := func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		if host != "localhost" {
 			t.Fatalf("lookup host = %q, want localhost", host)
@@ -467,9 +469,15 @@ func TestProbeHostnamePolicyRejectsLocalhostName(t *testing.T) {
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	}
 
-	_, err := resolveSafeProbeHostWithLookup(context.Background(), "localhost", true, lookup)
-	if !errors.Is(err, errUnsafeProbeTarget) {
-		t.Fatalf("localhost hostname error = %v, want errUnsafeProbeTarget", err)
+	addresses, err := resolveSafeProbeHostWithLookup(context.Background(), "localhost", true, lookup)
+	if err != nil || !reflect.DeepEqual(addresses, []netip.Addr{netip.MustParseAddr("127.0.0.1")}) {
+		t.Fatalf("localhost loopback resolution = %+v error=%v", addresses, err)
+	}
+	unsafeLookup := func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+	}
+	if _, err := resolveSafeProbeHostWithLookup(context.Background(), "localhost", true, unsafeLookup); !errors.Is(err, errUnsafeProbeTarget) {
+		t.Fatalf("localhost non-loopback error = %v, want errUnsafeProbeTarget", err)
 	}
 }
 
@@ -501,10 +509,10 @@ func TestSafeProbeResolverPinsVerifiedHostnameAddress(t *testing.T) {
 	}
 }
 
-func TestHTTPProbeRejectsDNSRebindingToPrivateAddress(t *testing.T) {
-	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "localhost", Type: "http_get", Address: "http://localhost", Count: 1, TimeoutMS: 1000})
-	if len(samples) != 1 || samples[0].Error != "unsafe_target" {
-		t.Fatalf("localhost http sample = %+v, want unsafe_target", samples)
+func TestHTTPProbeRejectsPlainHTTPHostname(t *testing.T) {
+	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "hostname", Type: "http_get", Address: "http://example.com:8080", Count: 1, TimeoutMS: 1000})
+	if len(samples) != 1 || samples[0].Error != "invalid_url" {
+		t.Fatalf("hostname http sample = %+v, want invalid_url", samples)
 	}
 }
 
@@ -525,7 +533,7 @@ func TestHTTPProbeRejectsUnsafeRedirectWithoutFollowing(t *testing.T) {
 	}
 
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "http://localhost:"+leakPort, http.StatusFound)
+		http.Redirect(w, r, "http://example.com:"+leakPort, http.StatusFound)
 	}))
 	defer redirector.Close()
 
@@ -535,6 +543,104 @@ func TestHTTPProbeRejectsUnsafeRedirectWithoutFollowing(t *testing.T) {
 	}
 	if leakHits.Load() != 0 {
 		t.Fatalf("unsafe redirect target was requested %d time(s), want 0", leakHits.Load())
+	}
+}
+
+func allowAgentTestTLSServers(t *testing.T) {
+	t.Helper()
+	original := http.DefaultTransport
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // test servers only
+	http.DefaultTransport = transport
+	t.Cleanup(func() {
+		http.DefaultTransport = original
+		transport.CloseIdleConnections()
+	})
+}
+
+func TestHTTPProbeRejectsMultiHopHTTPSDowngrade(t *testing.T) {
+	allowAgentTestTLSServers(t)
+	var finalHits atomic.Int64
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		finalHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer final.Close()
+	middle := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, final.URL, http.StatusFound)
+	}))
+	defer middle.Close()
+	start := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, middle.URL+"/next", http.StatusFound)
+	}))
+	defer start.Close()
+	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "downgrade", Type: "http_get", Address: start.URL, Count: 1, TimeoutMS: 1000})
+	if len(samples) != 1 || samples[0].Error != "unsafe_redirect" {
+		t.Fatalf("multi-hop downgrade sample=%+v", samples)
+	}
+	if finalHits.Load() != 0 {
+		t.Fatalf("downgraded endpoint received %d requests", finalHits.Load())
+	}
+}
+
+func TestHTTPProbeRedirectLimitIsBounded(t *testing.T) {
+	var hits atomic.Int64
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, request, server.URL+"/loop", http.StatusFound)
+	}))
+	defer server.Close()
+	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "loop", Type: "http_get", Address: server.URL, Count: 1, TimeoutMS: 1000})
+	if len(samples) != 1 || samples[0].Error != "unsafe_redirect" {
+		t.Fatalf("redirect loop sample=%+v", samples)
+	}
+	if hits.Load() > maxHTTPProbeRedirects {
+		t.Fatalf("redirect loop issued %d requests, want <= %d", hits.Load(), maxHTTPProbeRedirects)
+	}
+}
+
+func TestHTTPProbeCrossOriginRedirectDropsReferer(t *testing.T) {
+	allowAgentTestTLSServers(t)
+	var referer, authorization, cookie, userAgent string
+	final := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		referer = request.Header.Get("Referer")
+		authorization = request.Header.Get("Authorization")
+		cookie = request.Header.Get("Cookie")
+		userAgent = request.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer final.Close()
+	start := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, final.URL+"/final", http.StatusFound)
+	}))
+	defer start.Close()
+	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "headers", Type: "http_get", Address: start.URL + "/start?token=secret", Count: 1, TimeoutMS: 1000})
+	if len(samples) != 1 || !samples[0].Success {
+		t.Fatalf("safe HTTPS redirect sample=%+v", samples)
+	}
+	if referer != "" || authorization != "" || cookie != "" {
+		t.Fatalf("cross-origin headers leaked: referer=%q authorization=%q cookie=%q", referer, authorization, cookie)
+	}
+	if userAgent != "Zeno-Agent" {
+		t.Fatalf("user agent=%q", userAgent)
+	}
+}
+
+func TestHTTPProbeRejectsUserinfoBeforeDial(t *testing.T) {
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	unsafeURL := strings.Replace(server.URL, "http://", "http://user:pass@", 1)
+	samples := RunHTTPProbe(context.Background(), ProbeTarget{ID: "userinfo", Type: "http_get", Address: unsafeURL, Count: 1, TimeoutMS: 1000})
+	if len(samples) != 1 || samples[0].Error != "invalid_url" {
+		t.Fatalf("userinfo sample=%+v", samples)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("userinfo target received %d requests", hits.Load())
 	}
 }
 

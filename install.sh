@@ -24,6 +24,10 @@ SERVICE_NAME="zeno-agent"
 SERVICE_USER="zeno-agent"
 SERVICE_GROUP="zeno-agent"
 ALLOW_INSECURE_HTTP=0
+ALLOW_INSECURE_HTTP_REQUESTED="${ZENO_ALLOW_INSECURE_HTTP:-0}"
+MACOS_LOG_FILE="/var/log/zeno-agent.log"
+MACOS_NEWSYSLOG_CONFIG="/etc/newsyslog.d/zeno-agent.conf"
+MACOS_NEWSYSLOG_MARKER="# Managed by Zeno Agent installer"
 
 fail() {
   echo "错误: $*" >&2
@@ -345,9 +349,7 @@ validate_controller_url() {
         return 0
       fi
       if controller_url_has_explicit_port "$authority" && { is_ipv4_literal "$normalized_host" || is_ipv6_literal "$normalized_host"; }; then
-        # This is the one intentionally insecure product contract. Persist the
-        # explicit runtime opt-in in the service definition below; never relax
-        # the Agent's default URL validation globally.
+        [ "$ALLOW_INSECURE_HTTP_REQUESTED" = "1" ] || fail "远程 HTTP 需要显式设置 ZENO_ALLOW_INSECURE_HTTP=1；token 将以明文传输"
         ALLOW_INSECURE_HTTP=1
         return 0
       fi
@@ -550,7 +552,7 @@ assert_regular_file_or_absent() {
 
 token_owner_group() {
   case "$GOOS" in
-    darwin) printf 'root:wheel' ;;
+    darwin) printf 'root:%s' "$SERVICE_GROUP" ;;
     linux) printf 'root:%s' "$SERVICE_GROUP" ;;
     *) fail "暂不支持系统: $GOOS" ;;
   esac
@@ -558,8 +560,7 @@ token_owner_group() {
 
 token_expected_owner_mode() {
   case "$GOOS" in
-    darwin) printf '0:0:600' ;;
-    linux) printf '0:%s:640' "$(id -g "$SERVICE_USER")" ;;
+    darwin|linux) printf '0:%s:640' "$(id -g "$SERVICE_USER")" ;;
     *) fail "暂不支持系统: $GOOS" ;;
   esac
 }
@@ -586,11 +587,7 @@ set_token_owner_mode() {
   local path="$1"
   reject_symlink_path "$path" "token 文件"
   chown "$(token_owner_group)" "$path"
-  if [ "$GOOS" = "linux" ]; then
-    chmod 640 "$path"
-  else
-    chmod 600 "$path"
-  fi
+  chmod 640 "$path"
 }
 
 ensure_linux_service_account() {
@@ -667,6 +664,150 @@ remove_created_linux_service_account() {
   service_account_created=0
 }
 
+darwin_scalar_attribute() {
+  local record="$1"
+  local attribute="$2"
+  local output value
+  output=$(dscl . -read "$record" "$attribute" 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$output" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ] || return 1
+  case "$output" in
+    "$attribute: "*) value="${output#"$attribute: "}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+darwin_attribute_values() {
+  local record="$1"
+  local attribute="$2"
+  local output
+  output=$(dscl . -read "$record" "$attribute" 2>/dev/null) || return 1
+  printf '%s\n' "$output" | awk -v prefix="$attribute:" '
+    NR == 1 {
+      if ($1 != prefix) exit 2
+      sub("^[^:]+:[[:space:]]*", "")
+    }
+    { for (i = 1; i <= NF; i++) print $i }
+  '
+}
+
+validate_macos_service_account() {
+  [ "$GOOS" = "darwin" ] || return 0
+  local user_record="/Users/$SERVICE_USER"
+  local group_record="/Groups/$SERVICE_GROUP"
+  local uid gid primary_gid home shell password duplicate other membership member record_count
+  dscl . -read "$user_record" >/dev/null 2>&1 || fail "服务账户 $SERVICE_USER 不存在"
+  dscl . -read "$group_record" >/dev/null 2>&1 || fail "服务私有组 $SERVICE_GROUP 不存在"
+  uid=$(darwin_scalar_attribute "$user_record" UniqueID) || fail "服务账户 $SERVICE_USER 的 UniqueID 无效"
+  primary_gid=$(darwin_scalar_attribute "$user_record" PrimaryGroupID) || fail "服务账户 $SERVICE_USER 的 PrimaryGroupID 无效"
+  gid=$(darwin_scalar_attribute "$group_record" PrimaryGroupID) || fail "服务私有组 $SERVICE_GROUP 的 PrimaryGroupID 无效"
+  home=$(darwin_scalar_attribute "$user_record" NFSHomeDirectory) || fail "服务账户 $SERVICE_USER 的 home 无效"
+  shell=$(darwin_scalar_attribute "$user_record" UserShell) || fail "服务账户 $SERVICE_USER 的 shell 无效"
+  password=$(darwin_scalar_attribute "$user_record" Password) || fail "服务账户 $SERVICE_USER 的 Password 属性无效"
+  [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 1 ] && [ "$uid" -lt 500 ] || fail "已有账户 $SERVICE_USER 不是 macOS 系统账户"
+  [[ "$gid" =~ ^[0-9]+$ ]] && [ "$gid" -ge 1 ] && [ "$gid" -lt 500 ] || fail "已有组 $SERVICE_GROUP 不是 macOS 系统组"
+  [ "$primary_gid" = "$gid" ] || fail "服务账户 $SERVICE_USER 未使用同名私有主组"
+  [ "$home" = "/var/empty" ] || fail "已有账户 $SERVICE_USER 的 home 不是 /var/empty"
+  case "$shell" in /usr/bin/false|/usr/sbin/nologin) ;; *) fail "已有账户 $SERVICE_USER 不是 no-login 系统账户" ;; esac
+  case "$password" in '*'|'********') ;; *) fail "已有账户 $SERVICE_USER 未锁定密码登录" ;; esac
+
+  record_count=$(dscl . -list /Users UniqueID | awk -v id="$uid" -v name="$SERVICE_USER" '$1 == name && $2 == id { count++ } END { print count + 0 }')
+  [ "$record_count" -eq 1 ] || fail "服务账户 $SERVICE_USER 的 Directory Service 记录不唯一或不一致"
+  record_count=$(dscl . -list /Groups PrimaryGroupID | awk -v id="$gid" -v name="$SERVICE_GROUP" '$1 == name && $2 == id { count++ } END { print count + 0 }')
+  [ "$record_count" -eq 1 ] || fail "服务私有组 $SERVICE_GROUP 的 Directory Service 记录不唯一或不一致"
+  duplicate=$(dscl . -list /Users UniqueID | awk -v id="$uid" -v name="$SERVICE_USER" '$2 == id && $1 != name { print $1; exit }')
+  [ -z "$duplicate" ] || fail "服务账户 $SERVICE_USER 的 UID 被其他账户复用: $duplicate"
+  duplicate=$(dscl . -list /Groups PrimaryGroupID | awk -v id="$gid" -v name="$SERVICE_GROUP" '$2 == id && $1 != name { print $1; exit }')
+  [ -z "$duplicate" ] || fail "服务私有组 $SERVICE_GROUP 的 GID 被其他组复用: $duplicate"
+  other=$(dscl . -list /Users PrimaryGroupID | awk -v id="$gid" -v name="$SERVICE_USER" '$2 == id && $1 != name { print $1; exit }')
+  [ -z "$other" ] || fail "服务私有组 $SERVICE_GROUP 被其他账户作为主组使用: $other"
+  membership=$(darwin_attribute_values "$group_record" GroupMembership 2>/dev/null || true)
+  for member in $membership; do
+    [ "$member" = "$SERVICE_USER" ] || fail "服务私有组 $SERVICE_GROUP 含有其他成员: $member"
+  done
+  if [ -n "$(darwin_attribute_values "$group_record" GroupMembers 2>/dev/null || true)" ]; then
+    fail "服务私有组 $SERVICE_GROUP 含有不可验证的 UUID 成员"
+  fi
+  if [ -n "$(darwin_attribute_values "$user_record" AuthenticationAuthority 2>/dev/null || true)" ]; then
+    fail "服务账户 $SERVICE_USER 仍配置了认证授权信息"
+  fi
+}
+
+find_available_macos_system_id() {
+  local candidate user_ids group_ids
+  user_ids=$(dscl . -list /Users UniqueID) || return 1
+  group_ids=$(dscl . -list /Groups PrimaryGroupID) || return 1
+  for ((candidate = 499; candidate >= 200; candidate--)); do
+    if ! printf '%s\n' "$user_ids" | awk -v id="$candidate" '$2 == id { found=1 } END { exit found ? 0 : 1 }' && \
+       ! printf '%s\n' "$group_ids" | awk -v id="$candidate" '$2 == id { found=1 } END { exit found ? 0 : 1 }'; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_macos_service_account() {
+  [ "$GOOS" = "darwin" ] || return 0
+  local user_record="/Users/$SERVICE_USER"
+  local group_record="/Groups/$SERVICE_GROUP"
+  if dscl . -read "$user_record" >/dev/null 2>&1; then
+    validate_macos_service_account
+    return 0
+  fi
+  if dscl . -read "$group_record" >/dev/null 2>&1; then
+    fail "检测到没有同名服务账户的既有组 $SERVICE_GROUP；请先人工处理冲突"
+  fi
+
+  local account_id
+  account_id=$(find_available_macos_system_id) || fail "没有可用的 macOS 系统 UID/GID"
+  dscl . -create "$group_record" || fail "创建 macOS 服务私有组失败"
+  service_group_created=1
+  service_account_created=1
+  created_service_gid="$account_id"
+  dscl . -create "$group_record" Password '*' || fail "锁定 macOS 服务私有组失败"
+  dscl . -create "$group_record" PrimaryGroupID "$account_id" || fail "设置 macOS 服务组 GID 失败"
+  dscl . -create "$group_record" RealName 'Zeno Agent service group' || fail "设置 macOS 服务组描述失败"
+
+  dscl . -create "$user_record" || fail "创建 macOS 服务账户失败"
+  service_user_created=1
+  created_service_uid="$account_id"
+  dscl . -create "$user_record" Password '*' || fail "锁定 macOS 服务账户失败"
+  dscl . -create "$user_record" UniqueID "$account_id" || fail "设置 macOS 服务账户 UID 失败"
+  dscl . -create "$user_record" PrimaryGroupID "$account_id" || fail "设置 macOS 服务账户主组失败"
+  dscl . -create "$user_record" UserShell /usr/bin/false || fail "设置 macOS 服务账户 no-login shell 失败"
+  dscl . -create "$user_record" NFSHomeDirectory /var/empty || fail "设置 macOS 服务账户空 home 失败"
+  dscl . -create "$user_record" RealName 'Zeno Agent service account' || fail "设置 macOS 服务账户描述失败"
+  validate_macos_service_account
+}
+
+remove_created_macos_service_account() {
+  [ "$GOOS" = "darwin" ] || return 0
+  local current_id
+  if [ "$service_user_created" -eq 1 ]; then
+    current_id=$(darwin_scalar_attribute "/Users/$SERVICE_USER" UniqueID 2>/dev/null || true)
+    [ -z "$current_id" ] || [ "$current_id" = "$created_service_uid" ] || return 1
+    dscl . -delete "/Users/$SERVICE_USER" || return 1
+    service_user_created=0
+  fi
+  if [ "$service_group_created" -eq 1 ]; then
+    current_id=$(darwin_scalar_attribute "/Groups/$SERVICE_GROUP" PrimaryGroupID 2>/dev/null || true)
+    [ -z "$current_id" ] || [ "$current_id" = "$created_service_gid" ] || return 1
+    dscl . -delete "/Groups/$SERVICE_GROUP" || return 1
+    service_group_created=0
+  fi
+  service_account_created=0
+}
+
+remove_created_service_account() {
+  case "$GOOS" in
+    linux) remove_created_linux_service_account ;;
+    darwin) remove_created_macos_service_account ;;
+    *) return 1 ;;
+  esac
+}
+
 restore_token_backup() {
   local expected actual
   expected=$(file_owner_mode "$backup_token")
@@ -674,6 +815,19 @@ restore_token_backup() {
   actual=$(file_owner_mode "$TOKEN_FILE")
   [ "$actual" = "$expected" ] || {
     echo "token 文件原始 owner/mode 恢复不完整: $actual，期望 $expected" >&2
+    return 1
+  }
+}
+
+restore_token_metadata_from_backup() {
+  local expected actual owner group mode
+  expected=$(file_owner_mode "$backup_token")
+  IFS=: read -r owner group mode <<<"$expected"
+  chown "$owner:$group" "$TOKEN_FILE" || return 1
+  chmod "$mode" "$TOKEN_FILE" || return 1
+  actual=$(file_owner_mode "$TOKEN_FILE")
+  [ "$actual" = "$expected" ] || {
+    echo "新 runtime token 的旧 owner/mode 恢复不完整: $actual，期望 $expected" >&2
     return 1
   }
 }
@@ -697,6 +851,25 @@ write_token_file() {
   fi
   set_token_owner_mode "$TOKEN_FILE"
   assert_token_file_secure
+}
+
+run_agent_install_check() {
+  local check_args=(
+    -controller-url "$CONTROLLER_URL"
+    -node-id "$NODE_ID"
+    -token-file "$TOKEN_FILE"
+    -state-interval "$STATE_INTERVAL"
+    -heartbeat-interval "$HEARTBEAT_INTERVAL"
+    -host-interval "$HOST_INTERVAL"
+    -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL"
+    -version "$VERSION"
+    -install-check
+  )
+  if [ "$ALLOW_INSECURE_HTTP" -eq 1 ]; then
+    check_args+=(-allow-insecure-http)
+  fi
+  check_args+=("${extra_args[@]}")
+  "$BIN" "${check_args[@]}" || fail "Controller 未确认收到该 node 的 heartbeat/state，准备回滚"
 }
 
 install_linux_service() {
@@ -749,6 +922,10 @@ Group=$SERVICE_GROUP
 ExecStart=$exec_start
 Restart=always
 RestartSec=5s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+SendSIGKILL=yes
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -784,9 +961,8 @@ EOF_SERVICE
   fi
 }
 
-install_macos_service() {
+prepare_macos_service() {
   local plist="/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist"
-  local plist_tmp="${plist}.tmp.$$"
   local plist_backup=""
   service_kind="darwin"
   service_config="$plist"
@@ -806,6 +982,81 @@ install_macos_service() {
     cp -p "$plist" "$plist_backup"
     service_config_backup="$plist_backup"
   fi
+}
+
+prepare_macos_logging() {
+  assert_regular_file_or_absent "$MACOS_LOG_FILE" "macOS Agent 日志"
+  assert_regular_file_or_absent "$MACOS_NEWSYSLOG_CONFIG" "newsyslog 配置"
+  if [ -f "$MACOS_NEWSYSLOG_CONFIG" ]; then
+    [ "$(sed -n '1p' "$MACOS_NEWSYSLOG_CONFIG")" = "$MACOS_NEWSYSLOG_MARKER" ] || \
+      fail "检测到非安装器管理的 newsyslog 配置，拒绝覆盖: $MACOS_NEWSYSLOG_CONFIG"
+    macos_newsyslog_config_existed=1
+    macos_newsyslog_config_backup="$TMP/zeno-agent-newsyslog.conf.backup"
+    cp -p "$MACOS_NEWSYSLOG_CONFIG" "$macos_newsyslog_config_backup"
+  fi
+  if [ -f "$MACOS_LOG_FILE" ]; then
+    macos_log_existed=1
+    macos_log_old_metadata=$(file_owner_mode "$MACOS_LOG_FILE")
+  fi
+}
+
+install_macos_logging() {
+  local expected_log_metadata
+  if [ "$macos_log_existed" -eq 0 ]; then
+    install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 600 /dev/null "$MACOS_LOG_FILE"
+    macos_log_created=1
+  else
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$MACOS_LOG_FILE"
+    chmod 600 "$MACOS_LOG_FILE"
+  fi
+  assert_regular_file_or_absent "$MACOS_LOG_FILE" "macOS Agent 日志"
+  expected_log_metadata="$(id -u "$SERVICE_USER"):$(id -g "$SERVICE_USER"):600"
+  [ "$(file_owner_mode "$MACOS_LOG_FILE")" = "$expected_log_metadata" ] || \
+    fail "macOS Agent 日志 owner/mode 未收敛到 $expected_log_metadata"
+
+  local config_dir config_tmp
+  config_dir=$(dirname "$MACOS_NEWSYSLOG_CONFIG")
+  install -d -o root -g wheel -m 755 "$config_dir"
+  config_tmp="$config_dir/.zeno-agent.conf.tmp.$$"
+  rm -f "$config_tmp"
+  cat > "$config_tmp" <<EOF_NEWSYSLOG
+$MACOS_NEWSYSLOG_MARKER
+$MACOS_LOG_FILE  $SERVICE_USER:$SERVICE_GROUP  600  7  1024  *  N
+EOF_NEWSYSLOG
+  chown root:wheel "$config_tmp"
+  chmod 644 "$config_tmp"
+  if ! newsyslog -n -f "$config_tmp" "$MACOS_LOG_FILE" >/dev/null; then
+    rm -f "$config_tmp"
+    fail "newsyslog 配置校验失败"
+  fi
+  macos_logging_installed=1
+  mv -f "$config_tmp" "$MACOS_NEWSYSLOG_CONFIG"
+  [ "$(file_owner_mode "$MACOS_NEWSYSLOG_CONFIG")" = "0:0:644" ] || \
+    fail "newsyslog 配置 owner/mode 未收敛到 0:0:644"
+}
+
+restore_macos_logging() {
+  local owner group mode
+  if [ "$macos_logging_installed" -eq 1 ]; then
+    if [ "$macos_newsyslog_config_existed" -eq 1 ]; then
+      restore_file_backup_atomic "$macos_newsyslog_config_backup" "$MACOS_NEWSYSLOG_CONFIG" "newsyslog 配置" || return 1
+    else
+      rm -f "$MACOS_NEWSYSLOG_CONFIG" || return 1
+    fi
+  fi
+  if [ "$macos_log_created" -eq 1 ]; then
+    rm -f "$MACOS_LOG_FILE" || return 1
+  elif [ "$macos_log_existed" -eq 1 ] && [ -n "$macos_log_old_metadata" ]; then
+    IFS=: read -r owner group mode <<<"$macos_log_old_metadata"
+    chown "$owner:$group" "$MACOS_LOG_FILE" || return 1
+    chmod "$mode" "$MACOS_LOG_FILE" || return 1
+    [ "$(file_owner_mode "$MACOS_LOG_FILE")" = "$macos_log_old_metadata" ] || return 1
+  fi
+}
+
+install_macos_service() {
+  local plist="$service_config"
+  local plist_tmp="${plist}.tmp.$$"
 
   local plist_extra_args=""
   local arg
@@ -824,6 +1075,7 @@ install_macos_service() {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>li.shuijiao.zeno-agent</string>
+  <key>UserName</key><string>$(xml_escape "$SERVICE_USER")</string>
   <key>ProgramArguments</key>
   <array>
     <string>$(xml_escape "$BIN")</string>
@@ -835,23 +1087,25 @@ install_macos_service() {
     <string>-host-interval</string><string>$(xml_escape "$HOST_INTERVAL")</string>
     <string>-identity-refresh-interval</string><string>$(xml_escape "$IDENTITY_REFRESH_INTERVAL")</string>
     <string>-version</string><string>$(xml_escape "$VERSION")</string>
+    <string>-log-file</string><string>$(xml_escape "$MACOS_LOG_FILE")</string>
 ${plist_extra_args}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
+  <key>ExitTimeOut</key><integer>30</integer>
   <key>LowPriorityIO</key><true/>
   <key>Umask</key><integer>63</integer>
-  <key>StandardOutPath</key><string>/var/log/zeno-agent.log</string>
-  <key>StandardErrorPath</key><string>/var/log/zeno-agent.err.log</string>
 </dict>
 </plist>
 EOF_PLIST
   plutil -lint "$plist_tmp" >/dev/null || fail "LaunchDaemon 配置校验失败，未停止旧服务"
+  chown root:wheel "$plist_tmp"
+  chmod 644 "$plist_tmp"
+  if launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+    fail "旧 Zeno Agent LaunchDaemon 仍在运行，拒绝替换配置"
+  fi
   mv -f "$plist_tmp" "$plist"
-  chown root:wheel "$plist"
-  chmod 644 "$plist"
-  launchctl bootout system "$plist" >/dev/null 2>&1 || true
   if [ "$service_was_enabled" -eq 0 ]; then
     launchctl enable system/li.shuijiao.zeno-agent >/dev/null
   fi
@@ -896,8 +1150,13 @@ case "$OS" in
     ;;
   darwin)
     GOOS=darwin
+    SERVICE_USER="_zeno-agent"
+    SERVICE_GROUP="_zeno-agent"
     need plutil
     need launchctl
+    need dscl
+    need id
+    need newsyslog
     ;;
   *) fail "暂不支持系统: $OS" ;;
 esac
@@ -935,6 +1194,16 @@ service_was_enabled=0
 service_was_active=0
 enrollment_token_installed=0
 service_account_created=0
+service_user_created=0
+service_group_created=0
+created_service_uid=""
+created_service_gid=""
+macos_newsyslog_config_existed=0
+macos_newsyslog_config_backup=""
+macos_logging_installed=0
+macos_log_existed=0
+macos_log_created=0
+macos_log_old_metadata=""
 
 cleanup() {
   local status=$?
@@ -980,6 +1249,24 @@ cleanup() {
           cleanup_status=1
         fi
       fi
+    elif [ "$had_existing_token" -eq 1 ] && [ -n "$backup_token" ]; then
+      # The exchanged runtime token must remain, but an old daemon restored
+      # below must retain exactly the token access it had before this attempt.
+      if ! restore_token_metadata_from_backup; then
+        echo "新 runtime token 的旧 owner/mode 恢复失败，备份仍保留: $backup_token" >&2
+        cleanup_status=1
+      elif ! rm -f "$backup_token"; then
+        echo "移除旧 runtime token 备份失败: $backup_token" >&2
+        cleanup_status=1
+      else
+        backup_token=""
+      fi
+    fi
+    if [ "$service_kind" = "darwin" ]; then
+      if ! restore_macos_logging; then
+        echo "macOS 日志/newsyslog 配置恢复失败，请立即人工检查" >&2
+        cleanup_status=1
+      fi
     fi
     if [ -n "$service_config" ]; then
       if [ "$service_config_existed" -eq 1 ]; then
@@ -989,9 +1276,6 @@ cleanup() {
         else
           if [ "$service_kind" = "linux" ]; then
             chown root:root "$service_config" || cleanup_status=1
-            chmod 644 "$service_config" || cleanup_status=1
-          elif [ "$service_kind" = "darwin" ]; then
-            chown root:wheel "$service_config" || cleanup_status=1
             chmod 644 "$service_config" || cleanup_status=1
           fi
         fi
@@ -1049,15 +1333,22 @@ cleanup() {
           fi
         fi
       elif [ "$service_kind" = "darwin" ]; then
-        if [ "$service_was_enabled" -eq 0 ]; then
-          if ! launchctl disable system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
-            echo "恢复 launchd disabled 状态失败" >&2
+        if [ "$service_was_active" -eq 1 ]; then
+          # A launchd job can be loaded while disabled. Temporarily enable that
+          # edge case so bootstrap can restore the old active state, then put
+          # its disabled policy back exactly as it was.
+          if [ "$service_was_enabled" -eq 0 ] && ! launchctl enable system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+            echo "临时启用旧 launchd job 失败，无法恢复 active 状态" >&2
+            cleanup_status=1
+          fi
+          if ! launchctl bootstrap system "$service_config" >/dev/null 2>&1; then
+            echo "恢复 launchd active 状态失败" >&2
             cleanup_status=1
           fi
         fi
-        if [ "$service_was_active" -eq 1 ]; then
-          if ! launchctl bootstrap system "$service_config" >/dev/null 2>&1; then
-            echo "恢复 launchd active 状态失败" >&2
+        if [ "$service_was_enabled" -eq 0 ]; then
+          if ! launchctl disable system/li.shuijiao.zeno-agent >/dev/null 2>&1; then
+            echo "恢复 launchd disabled 状态失败" >&2
             cleanup_status=1
           fi
         fi
@@ -1070,7 +1361,7 @@ cleanup() {
   if [ "$status" -ne 0 ] && [ "$install_committed" -eq 0 ] && [ "$service_account_created" -eq 1 ]; then
     if [ "$enrollment_token_installed" -eq 1 ]; then
       echo "enrollment 已提交；保留本次创建的低权限服务账户 $SERVICE_USER 以继续保护新 runtime token" >&2
-    elif ! remove_created_linux_service_account; then
+    elif ! remove_created_service_account; then
       echo "移除安装器创建的服务账户/私有组失败，请立即人工检查: $SERVICE_USER" >&2
       cleanup_status=1
     fi
@@ -1124,9 +1415,12 @@ fi
 
 install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
 ensure_linux_service_account
+ensure_macos_service_account
 assert_regular_file_or_absent "$BIN" "Agent 二进制"
 if [ "$GOOS" = "darwin" ]; then
   assert_regular_file_or_absent "/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist" "LaunchDaemon 配置"
+  prepare_macos_service
+  prepare_macos_logging
 else
   assert_regular_file_or_absent "/etc/systemd/system/${SERVICE_NAME}.service" "systemd unit"
   current_enable_state=$(systemctl is-enabled "$SERVICE_NAME.service" 2>/dev/null || true)
@@ -1145,6 +1439,10 @@ if [ -e "$TOKEN_FILE" ]; then
   cp -p "$TOKEN_FILE" "$backup_token"
 fi
 install_started=1
+if [ "$GOOS" = "darwin" ]; then
+  stop_macos_service_for_restore || fail "旧 Zeno Agent LaunchDaemon 停止超时，拒绝继续安装"
+  install_macos_logging
+fi
 if [ -n "$ENROLLMENT_TOKEN" ]; then
   need curl
   TOKEN=$(generate_runtime_token)
@@ -1156,17 +1454,15 @@ if [ -n "$ENROLLMENT_TOKEN" ]; then
   exchange_agent_enrollment "$TOKEN"
   enrollment_token_installed=1
   # The new token is the only credential the service may need after its first
-  # authenticated request promotes it. Do not retain the old runtime token as
-  # an installer backup, and do not roll the new file back on later failures.
-  if [ -n "$backup_token" ]; then
-    rm -f "$backup_token"
-    backup_token=""
-  fi
+  # authenticated request promotes it. Retain the old token backup only until
+  # commit: rollback keeps the new contents but restores its old owner/mode so
+  # the previous service remains usable.
   ENROLLMENT_TOKEN=""
 else
   write_token_file
 fi
 atomic_install_binary "$FOUND" "$BIN" backup_bin
+run_agent_install_check
 
 if [ "$GOOS" = "darwin" ]; then
   install_macos_service

@@ -41,7 +41,7 @@ const (
 	maxProbeTargetBudgetMS    = 60_000
 	maxProbeNodeBudgetMS      = 120_000
 	probeUploadTimeout        = 30 * time.Second
-	maxHTTPProbeRedirects     = 5
+	maxHTTPProbeRedirects     = 10
 )
 
 var (
@@ -278,6 +278,16 @@ func RunHTTPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 			samples = append(samples, failedMeasuredProbeSample(seq, elapsedMS, classifyHTTPProbeError(err, ctxErr)))
 			continue
 		}
+		if response.Request == nil {
+			_ = response.Body.Close()
+			samples = append(samples, ProbeSample{Seq: seq, Success: false, Error: "unsafe_redirect"})
+			continue
+		}
+		if _, err := parseHTTPProbeURL(response.Request.URL.String()); err != nil {
+			_ = response.Body.Close()
+			samples = append(samples, ProbeSample{Seq: seq, Success: false, Error: "unsafe_redirect"})
+			continue
+		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
 		_ = response.Body.Close()
 		if response.StatusCode < 200 || response.StatusCode >= 400 {
@@ -382,7 +392,26 @@ func parseHTTPProbeURL(address string) (*url.URL, error) {
 			return nil, errInvalidProbeTarget
 		}
 	}
+	if parsed.Scheme == "http" && !allowedPlainHTTPProbeURL(parsed) {
+		return nil, errInvalidProbeTarget
+	}
 	return parsed, nil
+}
+
+func allowedPlainHTTPProbeURL(parsed *url.URL) bool {
+	if parsed == nil {
+		return false
+	}
+	host := normalizeProbeHost(parsed.Hostname())
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	address = address.Unmap()
+	return address.IsLoopback() || parsed.Port() != ""
 }
 
 func newHTTPProbeClient(timeout time.Duration) *http.Client {
@@ -409,8 +438,13 @@ func newHTTPProbeClientWithResolver(timeout time.Duration, resolver *safeProbeRe
 			if _, err := parseHTTPProbeURL(req.URL.String()); err != nil {
 				return fmt.Errorf("%w: %v", errUnsafeProbeRedirect, err)
 			}
-			if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			previous := via[len(via)-1].URL
+			if previous.Scheme == "https" && req.URL.Scheme != "https" {
 				return errUnsafeProbeRedirect
+			}
+			if !sameHTTPProbeOrigin(previous, req.URL) {
+				req.Header = make(http.Header)
+				req.Header.Set("User-Agent", "Zeno-Agent")
 			}
 			if _, err := resolver.resolve(req.Context(), req.URL.Hostname(), true); err != nil {
 				if classifyContextError(err) != "" {
@@ -421,6 +455,31 @@ func newHTTPProbeClientWithResolver(timeout time.Duration, resolver *safeProbeRe
 			return nil
 		},
 	}
+}
+
+func sameHTTPProbeOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectiveHTTPProbePort(left) == effectiveHTTPProbePort(right)
+}
+
+func effectiveHTTPProbePort(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	if port := value.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(value.Scheme, "http") {
+		return "80"
+	}
+	if strings.EqualFold(value.Scheme, "https") {
+		return "443"
+	}
+	return ""
 }
 
 func dialSafeProbeNetworkAddressWithResolver(ctx context.Context, network, address string, timeout time.Duration, resolver *safeProbeResolver) (net.Conn, error) {
@@ -553,11 +612,15 @@ func resolveSafeProbeHostWithLookup(ctx context.Context, host string, allowExpli
 	if len(addresses) == 0 {
 		return nil, errProbeDNS
 	}
+	allowLocalhostLoopback := allowExplicitLoopback && strings.EqualFold(host, "localhost")
 	seen := map[netip.Addr]struct{}{}
 	result := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
 		address = address.Unmap()
-		if err := validateSafeProbeAddress(address, false); err != nil {
+		if allowLocalhostLoopback && !address.IsLoopback() {
+			return nil, errUnsafeProbeTarget
+		}
+		if err := validateSafeProbeAddress(address, allowLocalhostLoopback); err != nil {
 			return nil, err
 		}
 		if _, ok := seen[address]; ok {

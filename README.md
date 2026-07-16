@@ -46,9 +46,9 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 - `ZENO_AGENT_TOKEN_FILE`：token 文件路径，默认 `/etc/zeno/agent-token`
 - `ZENO_AGENT_BIN`：二进制安装路径，默认 `/usr/local/bin/zeno-agent`
 
-远程 Controller 默认必须使用 HTTPS。为兼容无反代的直连部署，安装器仅会对“远程直接 IP + 显式端口”的 HTTP URL 在服务配置中持久化 `-allow-insecure-http`；这会让 enrollment/runtime bearer token 以明文传输，应只在已明确接受该风险的受控网络使用。主机名 HTTP、无显式端口的远程 HTTP 仍会被拒绝，手动运行二进制时也必须显式提供该 flag。
+远程 Controller 默认必须使用 HTTPS。为兼容无反代的直连部署，“远程直接 IP + 显式端口”的 HTTP URL 必须给安装器显式设置 `ZENO_ALLOW_INSECURE_HTTP=1`，安装器才会在服务配置中持久化 `-allow-insecure-http`；这会让 enrollment/runtime bearer token 以明文传输，应只在已明确接受该风险的受控网络使用。主机名 HTTP、无显式端口的远程 HTTP 仍会被拒绝，手动运行二进制时也必须显式提供该 flag。
 
-Linux 安装脚本会创建固定的非 root `zeno-agent` 系统账户，写入 / 更新 `zeno-agent.service`，并只保留 ICMP 所需的 `CAP_NET_RAW`；token 由 root 持有且仅向服务私有主组开放读取。若主机已有同名普通账户、共享组或不符合 nologin/no-home 约束的账户，安装器会拒绝继续，避免扩大 token 读取范围；安装失败时会原样恢复既有 token 的 owner/mode，并清理本次尚未提交的服务账户。macOS 会写入 `/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist`，目前仍以 root LaunchDaemon 运行。Windows fresh install 使用 `NT SERVICE\zeno-agent` 虚拟账户、受限 required-privileges 列表和 service-SID token ACL；为保证可回滚，未知账户的既有 Windows 服务不会自动迁移。安装脚本可重复执行，并把旧二进制备份轮转为最新 3 份；安装脚本不会安装 Controller，也不会修改业务服务。
+Linux 安装脚本会创建固定的非 root `zeno-agent` 系统账户，写入 / 更新 `zeno-agent.service`，并只保留 ICMP 所需的 `CAP_NET_RAW`；token 由 root 持有且仅向服务私有主组开放读取。若主机已有同名普通账户、共享组或不符合 nologin/no-home 约束的账户，安装器会拒绝继续，避免扩大 token 读取范围；安装失败时会原样恢复既有 token 的 owner/mode，并清理本次尚未提交的服务账户。macOS 会创建固定的非登录 `_zeno-agent` 系统账户，写入 `/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist`，并通过 `/etc/newsyslog.d/zeno-agent.conf` 轮转仅该账户可读写的 Agent 日志；未知的同名 newsyslog 配置不会被覆盖。Windows fresh install 使用 `NT SERVICE\zeno-agent` 虚拟账户、受限 required-privileges 列表和 service-SID token ACL；为保证可回滚，未知账户的既有 Windows 服务不会自动迁移。三个平台都会在修改服务配置前使用 token 文件执行严格安装检查，只有 Controller 同时接受该 node 的 heartbeat 和 state 后才会继续。安装脚本可重复执行，并把旧二进制备份轮转为最新 3 份；安装脚本不会安装 Controller，也不会修改业务服务。
 
 ## 手动构建
 

@@ -25,6 +25,7 @@ $NetworkInterfaces = $env:ZENO_AGENT_NETWORK_INTERFACES
 $DiskMounts = $env:ZENO_AGENT_DISK_MOUNTS
 # The Windows binary registers this exact SCM service name in svc.Run.
 $ServiceName = 'zeno-agent'
+$AllowInsecureHTTPRequested = $env:ZENO_ALLOW_INSECURE_HTTP -eq '1'
 $AllowInsecureHTTP = $false
 
 function Fail($Message) {
@@ -355,14 +356,17 @@ function Get-ServiceRegistryPolicy($Name) {
   $start = [int]$item.Start
   $delayedProperty = $item.PSObject.Properties['DelayedAutostart']
   $sidProperty = $item.PSObject.Properties['ServiceSidType']
+  $privilegesProperty = $item.PSObject.Properties['RequiredPrivileges']
   $delayed = if ($delayedProperty) { [int]$delayedProperty.Value } else { 0 }
   $sidType = if ($sidProperty) { [int]$sidProperty.Value } else { 0 }
+  $requiredPrivileges = if ($privilegesProperty) { @($privilegesProperty.Value) } else { @() }
   if ($start -notin @(2, 3, 4)) { Fail "现有服务启动策略不受支持，拒绝修改: Start=$start" }
   if ($sidType -notin @(0, 1, 3)) { Fail "现有服务 SID 策略不受支持，拒绝修改: ServiceSidType=$sidType" }
   return [PSCustomObject]@{
     Start = $start
     DelayedAutoStart = $delayed
     SidType = $sidType
+    RequiredPrivileges = @($requiredPrivileges)
   }
 }
 
@@ -371,6 +375,32 @@ function Set-ServiceBinaryPath($Name, $BinaryPathName) {
   if (-not $service) { return $false }
   $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ PathName = $BinaryPathName } -ErrorAction Stop
   return $result -and ([int]$result.ReturnValue -eq 0)
+}
+
+function Set-ServiceLogonAccount($Name, $AccountName) {
+  & sc.exe config $Name obj= $AccountName password= "" | Out-Null
+  return $LASTEXITCODE -eq 0
+}
+
+function Test-ServiceLogonAccount($Name, $AccountName) {
+  $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+  return $service -and ([string]$service.StartName).Equals($AccountName, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-ServiceLogonAccount($Name, $AccountName) {
+  if (-not (Test-ServiceLogonAccount -Name $Name -AccountName $AccountName)) {
+    Fail "Zeno Agent 服务账户未生效: $AccountName"
+  }
+}
+
+function Set-ServiceRequiredPrivileges($Name, [string[]]$Privileges) {
+  $privilegeList = (@($Privileges) -join '/')
+  # Windows PowerShell 5.1 can drop a native empty-string argument. Preserve
+  # the quoted empty value explicitly so rollback can clear an originally
+  # absent RequiredPrivileges list instead of accidentally querying it.
+  $privilegeListArgument = if ($privilegeList) { $privilegeList } else { '""' }
+  & sc.exe privs $Name $privilegeListArgument | Out-Null
+  return $LASTEXITCODE -eq 0
 }
 
 function Convert-ServiceStartPolicyToScValue($Start, $DelayedAutoStart) {
@@ -410,8 +440,7 @@ function Assert-ControllerURL($Value) {
     $authority = if ($authorityMatch.Success) { $authorityMatch.Groups[1].Value } else { '' }
     $hasExplicitPort = ($authority -match '^\[[^]]+\]:[0-9]+$') -or ($authority -match '^[^:]+:[0-9]+$')
     if ($isIPAddress -and $hasExplicitPort -and $parsed.Port -ge 1 -and $parsed.Port -le 65535) {
-      # Persist this explicit plaintext-token opt-in in the SCM binPath. The
-      # Agent runtime remains fail-closed for every other remote HTTP URL.
+      if (-not $AllowInsecureHTTPRequested) { Fail '远程 HTTP 需要显式设置 ZENO_ALLOW_INSECURE_HTTP=1；token 将以明文传输' }
       $script:AllowInsecureHTTP = $true
       return
     }
@@ -466,7 +495,12 @@ $OldBinaryPathName = $null
 $OldServiceStart = $null
 $OldDelayedAutoStart = 0
 $OldServiceSidType = $null
+$OldServiceStartName = $null
+$OldServiceRequiredPrivileges = @()
 $ServiceSidTypeChanged = $false
+$ServiceAccountChanged = $false
+$ServiceRequiredPrivilegesChanged = $false
+$ManagedServiceAccount = $false
 $ServiceBinPathChanged = $false
 $OldServiceWasRunning = $false
 $Existing = $null
@@ -515,6 +549,9 @@ try {
     $OldServiceStart = $oldPolicy.Start
     $OldDelayedAutoStart = $oldPolicy.DelayedAutoStart
     $OldServiceSidType = $oldPolicy.SidType
+    $OldServiceStartName = [string]$oldService.StartName
+    if (-not $OldServiceStartName) { Fail '无法读取旧 zeno-agent 服务账户，拒绝修改' }
+    $OldServiceRequiredPrivileges = @($oldPolicy.RequiredPrivileges)
     if (-not (Stop-ServiceAndWait -Name $ServiceName)) { Fail '旧 zeno-agent 服务停止超时，拒绝覆盖现有二进制' }
   }
 
@@ -576,6 +613,15 @@ try {
   if ($NetworkInterfaces) { $Args += @('-network-interfaces', $NetworkInterfaces) }
   if ($DiskMounts) { $Args += @('-disk-mounts', $DiskMounts) }
   if ($AllowInsecureHTTP) { $Args += '-allow-insecure-http' }
+
+  # Verify the downloaded binary, runtime token, Controller URL, and TLS path
+  # before mutating SCM. The token itself remains in the protected token file
+  # and is never placed in argv or inherited process environment.
+  $CheckArgs = @($Args) + @('-install-check')
+  & $Bin @CheckArgs
+  if ($LASTEXITCODE -ne 0) {
+    Fail 'Controller 未确认收到该 node 的 heartbeat/state，准备回滚'
+  }
   $BinPath = Join-WindowsCommandLine -FilePath $Bin -Arguments $Args
 
   if ($Existing) {
@@ -589,23 +635,46 @@ try {
   }
   if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail 'Zeno Agent 服务创建失败' }
   if ($CreatedService) {
-    # Fresh installs run as the per-service virtual account instead of
-    # LocalSystem. Existing services are not account-migrated here because the
-    # installer cannot safely recover an unknown prior account password.
-    & sc.exe config $ServiceName obj= "NT SERVICE\$ServiceName" password= "" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 虚拟服务账户配置失败' }
+    if (-not (Set-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName")) { Fail 'Zeno Agent 虚拟服务账户配置失败' }
+    $ManagedServiceAccount = $true
+    Assert-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"
     & sc.exe sidtype $ServiceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
-    & sc.exe privs $ServiceName SeChangeNotifyPrivilege | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务权限收敛配置失败' }
+    if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges @('SeChangeNotifyPrivilege'))) { Fail 'Zeno Agent 服务权限收敛配置失败' }
     & sc.exe failure $ServiceName reset= 60 actions= restart/5000/restart/5000/restart/5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务失败恢复策略配置失败' }
-  } elseif ($OldServiceSidType -eq 0) {
-    # Existing restricted services are already able to use their service SID;
-    # do not weaken that policy. Only SERVICE_SID_TYPE_NONE must be upgraded.
-    & sc.exe sidtype $ServiceName unrestricted | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
-    $ServiceSidTypeChanged = $true
+  } else {
+    if ($OldServiceStartName.Equals('LocalSystem', [StringComparison]::OrdinalIgnoreCase)) {
+      # LocalSystem has no password to recover, so this legacy account can be
+      # migrated transactionally. Unknown/custom accounts are deliberately
+      # left untouched because their passwords cannot be reconstructed.
+      if (-not (Set-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName")) { Fail '旧 Zeno Agent 服务降权迁移失败' }
+      $ServiceAccountChanged = $true
+      $ManagedServiceAccount = $true
+      Assert-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"
+    } elseif ($OldServiceStartName.Equals("NT SERVICE\$ServiceName", [StringComparison]::OrdinalIgnoreCase)) {
+      $ManagedServiceAccount = $true
+      Assert-ServiceLogonAccount -Name $ServiceName -AccountName "NT SERVICE\$ServiceName"
+    } else {
+      Write-Warning "保留现有 zeno-agent 自定义服务账户: $OldServiceStartName"
+    }
+    if ($OldServiceSidType -eq 0) {
+      # Existing restricted services already expose a usable service SID; do
+      # not weaken that policy. Only SERVICE_SID_TYPE_NONE must be upgraded.
+      & sc.exe sidtype $ServiceName unrestricted | Out-Null
+      if ($LASTEXITCODE -ne 0) { Fail 'Zeno Agent 服务 SID 配置失败' }
+      $ServiceSidTypeChanged = $true
+    }
+    if ($ManagedServiceAccount -and ((@($OldServiceRequiredPrivileges) -join '/') -ne 'SeChangeNotifyPrivilege')) {
+      if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges @('SeChangeNotifyPrivilege'))) { Fail 'Zeno Agent 服务权限收敛配置失败' }
+      $ServiceRequiredPrivilegesChanged = $true
+    }
+  }
+
+  $effectivePolicy = Get-ServiceRegistryPolicy -Name $ServiceName
+  if ($effectivePolicy.SidType -eq 0) { Fail 'Zeno Agent 服务 SID 未生效' }
+  if ($ManagedServiceAccount -and ((@($effectivePolicy.RequiredPrivileges) -join '/') -ne 'SeChangeNotifyPrivilege')) {
+    Fail 'Zeno Agent 服务最小权限列表未生效'
   }
 
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
@@ -683,6 +752,30 @@ try {
     $restoreSidType = Convert-ServiceSidTypeToScValue -SidType $OldServiceSidType
     & sc.exe sidtype $ServiceName $restoreSidType | Out-Null
     if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("旧服务 SID 策略恢复失败: $restoreSidType") }
+  }
+  if ($ServiceRequiredPrivilegesChanged -and -not $CreatedService) {
+    try {
+      if (-not (Set-ServiceRequiredPrivileges -Name $ServiceName -Privileges $OldServiceRequiredPrivileges)) {
+        [Console]::Error.WriteLine('旧服务最小权限列表恢复失败')
+      } else {
+        $restoredPrivileges = @((Get-ServiceRegistryPolicy -Name $ServiceName).RequiredPrivileges)
+        if (($restoredPrivileges -join '/') -ne (@($OldServiceRequiredPrivileges) -join '/')) {
+          [Console]::Error.WriteLine('旧服务最小权限列表恢复验证失败')
+        }
+      }
+    } catch {
+      [Console]::Error.WriteLine("旧服务最小权限列表恢复验证失败: $_")
+    }
+  }
+  if ($ServiceAccountChanged -and $OldServiceStartName -and -not $CreatedService) {
+    try {
+      if (-not (Set-ServiceLogonAccount -Name $ServiceName -AccountName $OldServiceStartName) -or
+          -not (Test-ServiceLogonAccount -Name $ServiceName -AccountName $OldServiceStartName)) {
+        [Console]::Error.WriteLine("旧服务账户恢复失败: $OldServiceStartName")
+      }
+    } catch {
+      [Console]::Error.WriteLine("旧服务账户恢复验证失败: $OldServiceStartName；错误: $_")
+    }
   }
   if ($Existing -and -not $CreatedService -and $null -ne $OldServiceStart) {
     $restoreStartMode = Convert-ServiceStartPolicyToScValue -Start $OldServiceStart -DelayedAutoStart $OldDelayedAutoStart

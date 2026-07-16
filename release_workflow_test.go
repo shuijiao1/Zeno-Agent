@@ -112,8 +112,8 @@ func TestReleasePolicyVersionInjectionVulnerabilityGateAndSBOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read VERSION: %v", err)
 	}
-	if version := strings.TrimSpace(string(versionBytes)); version != "v0.5.0" {
-		t.Fatalf("VERSION = %q, want current formal version v0.5.0", version)
+	if version := strings.TrimSpace(string(versionBytes)); version != "v0.5.1" {
+		t.Fatalf("VERSION = %q, want current formal version v0.5.1", version)
 	}
 }
 

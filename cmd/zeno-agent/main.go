@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +27,7 @@ const defaultHostInterval = 30 * time.Minute
 const defaultIdentityRefreshInterval = 12 * time.Hour
 const defaultProbeConfigPollInterval = time.Minute
 const probeConfigRefreshTimeout = 20 * time.Second
+const installCheckTimeout = 30 * time.Second
 
 var probeConfigPollInterval = defaultProbeConfigPollInterval
 var probeRunLoopInterval = time.Second
@@ -44,6 +46,8 @@ type config struct {
 	NetworkInterfaces       string
 	DiskMounts              string
 	AllowInsecureHTTP       bool
+	InstallCheck            bool
+	LogFile                 string
 }
 
 func main() {
@@ -63,6 +67,8 @@ func main() {
 	flag.StringVar(&cfg.NetworkInterfaces, "network-interfaces", "", "comma-separated network interface allowlist; default excludes virtual/container interfaces")
 	flag.StringVar(&cfg.DiskMounts, "disk-mounts", "", "comma-separated disk mount/path allowlist; default sums real filesystems")
 	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "explicitly allow a direct IP controller with an explicit port over HTTP (bearer token is sent in plaintext)")
+	flag.BoolVar(&cfg.InstallCheck, "install-check", false, "verify that the controller accepts one heartbeat and one state report, then exit")
+	flag.StringVar(&cfg.LogFile, "log-file", "", "write logs to this file, reopening it for every record so external rotation is safe")
 	flag.Parse()
 	if legacyInterval > 0 {
 		cfg.StateInterval = legacyInterval
@@ -73,15 +79,25 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg.Token = token
+	if err := configureLogFile(cfg.LogFile); err != nil {
+		log.Fatal(err)
+	}
 	if err := runPlatform(cfg); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func runConsole(cfg config) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+func runConsole(cfg config, shutdownSignals ...os.Signal) error {
+	if len(shutdownSignals) == 0 {
+		shutdownSignals = []os.Signal{os.Interrupt}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
-	return run(ctx, cfg)
+	err := run(ctx, cfg)
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func normalizeConfigIntervals(cfg *config) {
@@ -106,8 +122,23 @@ func run(ctx context.Context, cfg config) error {
 	}
 	client := agent.NewClientWithOptions(cfg.ControllerURL, cfg.NodeID, cfg.Token, agent.ClientOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
 	collector := agent.NewMetricsCollector(agent.MetricsOptions{NetworkInterfaceAllowlist: splitCommaList(cfg.NetworkInterfaces), DiskMountAllowlist: splitCommaList(cfg.DiskMounts)})
+	if cfg.InstallCheck {
+		return verifyController(ctx, cfg, client, collector)
+	}
 	identityDiscoverer := agent.NewCachedNetworkIdentityDiscoverer(agent.NewNetworkIdentityDiscoverer(), cfg.IdentityRefreshInterval)
 	return runAgent(ctx, cfg, client, collector, identityDiscoverer)
+}
+
+func verifyController(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector) error {
+	checkCtx, cancel := context.WithTimeout(ctx, installCheckTimeout)
+	defer cancel()
+	if err := reportHeartbeat(checkCtx, client, cfg.Version); err != nil {
+		return fmt.Errorf("controller heartbeat install check failed: %w", err)
+	}
+	if err := reportState(checkCtx, client, collector); err != nil {
+		return fmt.Errorf("controller state install check failed: %w", err)
+	}
+	return nil
 }
 
 func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector, identityDiscoverer networkIdentityDiscoverer) error {

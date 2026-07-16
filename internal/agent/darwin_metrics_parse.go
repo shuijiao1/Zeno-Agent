@@ -175,6 +175,7 @@ func (p *darwinNetworkParser) consume(line string) error {
 	}
 	p.totals.InBytes += inBytes
 	p.totals.OutBytes += outBytes
+	p.totals.SourceNames = append(p.totals.SourceNames, name)
 	return nil
 }
 

@@ -145,6 +145,7 @@ func windowsNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) 
 		if err := addNetworkCounter(&totals.OutBytes, row.OutOctets); err != nil {
 			return networkTotals{}, err
 		}
+		totals.SourceNames = append(totals.SourceNames, fmt.Sprintf("if:%d", row.InterfaceIndex))
 	}
 	return totals, nil
 }
@@ -178,6 +179,7 @@ func windowsNetworkTotalsLegacy(allowlist map[string]struct{}) (networkTotals, e
 		if err := addNetworkCounter(&totals.OutBytes, uint64(row.OutOctets)); err != nil {
 			return networkTotals{}, err
 		}
+		totals.SourceNames = append(totals.SourceNames, fmt.Sprintf("if:%d", row.Index))
 	}
 	return totals, nil
 }

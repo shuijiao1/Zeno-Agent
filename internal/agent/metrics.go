@@ -2,10 +2,13 @@ package agent
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,19 +16,20 @@ import (
 )
 
 type MetricsCollector struct {
-	mu               sync.Mutex
-	previousCPU      cpuTimes
-	hasCPU           bool
-	previousNet      networkTotals
-	previousNetAt    time.Time
-	hasNet           bool
-	previousTCP      int64
-	previousUDP      int64
-	hasConnections   bool
-	networkAllowlist map[string]struct{}
-	diskAllowlist    []string
-	networkReader    func(map[string]struct{}) (networkTotals, error)
-	connectionReader func() (tcp int64, udp int64, err error)
+	mu                sync.Mutex
+	previousCPU       cpuTimes
+	hasCPU            bool
+	previousNet       networkTotals
+	previousNetSource string
+	previousNetAt     time.Time
+	hasNet            bool
+	previousTCP       int64
+	previousUDP       int64
+	hasConnections    bool
+	networkAllowlist  map[string]struct{}
+	diskAllowlist     []string
+	networkReader     func(map[string]struct{}) (networkTotals, error)
+	connectionReader  func() (tcp int64, udp int64, err error)
 }
 
 type MetricsOptions struct {
@@ -81,6 +85,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 		networkReader = readNetworkTotals
 	}
 	netTotals, netErr := networkReader(c.networkAllowlist)
+	netCounterSource := networkCounterSourceID(netTotals.SourceNames)
 	connectionReader := c.connectionReader
 	if connectionReader == nil {
 		connectionReader = connectionCounts
@@ -88,7 +93,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 	tcpConnections, udpConnections, connectionErr := connectionReader()
 	var inSpeed, outSpeed float64
 	if netErr == nil {
-		if c.hasNet {
+		if c.hasNet && (netCounterSource == "" || c.previousNetSource == "" || netCounterSource == c.previousNetSource) {
 			elapsed := now.Sub(c.previousNetAt).Seconds()
 			if elapsed > 0 {
 				inSpeed = float64(nonNegativeInt64(netTotals.InBytes-c.previousNet.InBytes)) / elapsed
@@ -96,6 +101,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 			}
 		}
 		c.previousNet = netTotals
+		c.previousNetSource = netCounterSource
 		c.previousNetAt = now
 		c.hasNet = true
 	} else if c.hasNet {
@@ -103,6 +109,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 		// last valid values and, critically, do not move previousNetAt: the next
 		// valid rate is calculated over the complete elapsed interval.
 		netTotals = c.previousNet
+		netCounterSource = c.previousNetSource
 	}
 	if connectionErr == nil {
 		c.previousTCP = tcpConnections
@@ -132,6 +139,7 @@ func (c *MetricsCollector) CollectState(now time.Time) StateSample {
 		NetInSpeedBps:         inSpeed,
 		NetOutSpeedBps:        outSpeed,
 		NetTotalsValid:        &netTotalsValid,
+		NetCounterSource:      netCounterSource,
 		ProcessCount:          processCount(),
 		TCPConnectionCount:    tcpConnections,
 		UDPConnectionCount:    udpConnections,
@@ -367,8 +375,19 @@ func optionalConnectionCountFromFile(path string) (int64, error) {
 }
 
 type networkTotals struct {
-	InBytes  int64
-	OutBytes int64
+	InBytes     int64
+	OutBytes    int64
+	SourceNames []string
+}
+
+func networkCounterSourceID(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	stable := append([]string(nil), names...)
+	sort.Strings(stable)
+	sum := sha256.Sum256([]byte(runtime.GOOS + "\x00" + strings.Join(stable, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 var defaultExcludedInterfacePrefixes = []string{
@@ -449,6 +468,7 @@ func parseLinuxNetworkTotals(content string, allowlist map[string]struct{}) (net
 		}
 		totals.InBytes += inBytes
 		totals.OutBytes += outBytes
+		totals.SourceNames = append(totals.SourceNames, iface)
 	}
 	if err := scanner.Err(); err != nil {
 		return networkTotals{}, err
