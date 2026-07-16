@@ -767,7 +767,7 @@ func TestWindowsVirtualServiceAccountPreservesEmptyPasswordThroughCmd(t *testing
 		"unsupported service account",
 		`password= ""`,
 		"& $env:ComSpec /d /s /c $commandLine",
-		"$LASTEXITCODE -eq 0",
+		"$exitCode -eq 0",
 	} {
 		if !strings.Contains(function, want) {
 			t.Fatalf("Windows service account migration missing %q", want)
