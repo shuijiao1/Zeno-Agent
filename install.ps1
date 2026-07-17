@@ -9,6 +9,7 @@ $Version = if ($env:ZENO_AGENT_VERSION) { $env:ZENO_AGENT_VERSION } else { 'late
 $InstallDir = if ($env:ZENO_AGENT_INSTALL_DIR) { $env:ZENO_AGENT_INSTALL_DIR } else { Join-Path $env:ProgramFiles 'Zeno Agent' }
 $Bin = if ($env:ZENO_AGENT_BIN) { $env:ZENO_AGENT_BIN } else { Join-Path $InstallDir 'zeno-agent.exe' }
 $TokenFile = if ($env:ZENO_AGENT_TOKEN_FILE) { $env:ZENO_AGENT_TOKEN_FILE } else { Join-Path $env:ProgramData 'Zeno\agent-token' }
+$DataDir = Join-Path $env:ProgramData 'Zeno\agent-data'
 $ControllerURL = $env:ZENO_CONTROLLER_URL
 $NodeID = $env:ZENO_NODE_ID
 $Token = $env:ZENO_AGENT_TOKEN
@@ -314,6 +315,26 @@ function Set-ServiceReceiptDirectoryAcl($Path, $Name) {
     @{ Identity = 'NT AUTHORITY\SYSTEM'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
     @{ Identity = 'BUILTIN\Administrators'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
     @{ Identity = "NT SERVICE\$Name"; Rights = [Security.AccessControl.FileSystemRights]::Modify }
+  )) {
+    $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+      $entry.Identity, $entry.Rights, $inherit, $none, [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($rule)
+  }
+  $acl.SetOwner((New-Object Security.Principal.NTAccount('BUILTIN\Administrators')))
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-ServiceDataDirectoryAcl($Path, $IdentityName) {
+  New-Item -ItemType Directory -Force -Path $Path | Out-Null
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  $none = [Security.AccessControl.PropagationFlags]::None
+  foreach ($entry in @(
+    @{ Identity = 'NT AUTHORITY\SYSTEM'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+    @{ Identity = 'BUILTIN\Administrators'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+    @{ Identity = $IdentityName; Rights = [Security.AccessControl.FileSystemRights]::Modify }
   )) {
     $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
       $entry.Identity, $entry.Rights, $inherit, $none, [Security.AccessControl.AccessControlType]::Allow
@@ -702,6 +723,7 @@ try {
     '-heartbeat-interval', $HeartbeatInterval,
     '-host-interval', $HostInterval,
     '-identity-refresh-interval', $IdentityRefreshInterval,
+    '-data-dir', $DataDir,
     '-version', $Version
   )
   if ($NetworkInterfaces) { $Args += @('-network-interfaces', $NetworkInterfaces) }
@@ -778,6 +800,9 @@ try {
   }
 
   Set-ServiceReceiptDirectoryAcl -Path $InstallReceiptDir -Name $ServiceName
+
+  $EffectiveService = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+  Set-ServiceDataDirectoryAcl -Path $DataDir -IdentityName ([string]$EffectiveService.StartName)
 
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName

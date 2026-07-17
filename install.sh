@@ -872,6 +872,7 @@ run_agent_install_check() {
     -heartbeat-interval "$HEARTBEAT_INTERVAL"
     -host-interval "$HOST_INTERVAL"
     -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL"
+    -data-dir "$AGENT_DATA_DIR"
     -version "$VERSION"
     -install-check
   )
@@ -932,6 +933,7 @@ install_linux_service() {
     -heartbeat-interval "$HEARTBEAT_INTERVAL" \
     -host-interval "$HOST_INTERVAL" \
     -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL" \
+    -data-dir "$AGENT_DATA_DIR" \
     -version "$VERSION" \
     -install-receipt-file "$install_receipt_file" \
     -install-receipt-nonce "$install_receipt_nonce" \
@@ -994,6 +996,8 @@ CapabilityBoundingSet=CAP_NET_RAW
 AmbientCapabilities=CAP_NET_RAW
 RuntimeDirectory=zeno-agent
 RuntimeDirectoryMode=0700
+StateDirectory=zeno-agent
+StateDirectoryMode=0700
 UMask=0077
 
 [Install]
@@ -1135,6 +1139,7 @@ install_macos_service() {
     <string>-heartbeat-interval</string><string>$(xml_escape "$HEARTBEAT_INTERVAL")</string>
     <string>-host-interval</string><string>$(xml_escape "$HOST_INTERVAL")</string>
     <string>-identity-refresh-interval</string><string>$(xml_escape "$IDENTITY_REFRESH_INTERVAL")</string>
+    <string>-data-dir</string><string>$(xml_escape "$AGENT_DATA_DIR")</string>
     <string>-version</string><string>$(xml_escape "$VERSION")</string>
     <string>-install-receipt-file</string><string>$(xml_escape "$install_receipt_file")</string>
     <string>-install-receipt-nonce</string><string>$(xml_escape "$install_receipt_nonce")</string>
@@ -1192,6 +1197,7 @@ ARCH=$(uname -m)
 case "$OS" in
   linux)
     GOOS=linux
+    AGENT_DATA_DIR="/var/lib/zeno-agent"
     need systemctl
     need getent
     need id
@@ -1201,6 +1207,7 @@ case "$OS" in
     ;;
   darwin)
     GOOS=darwin
+    AGENT_DATA_DIR="/Library/Application Support/Zeno Agent/data"
     SERVICE_USER="_zeno-agent"
     SERVICE_GROUP="_zeno-agent"
     need plutil
@@ -1472,6 +1479,10 @@ fi
 install -d -m 755 "$(dirname "$BIN")" "$INSTALL_DIR" "$(dirname "$TOKEN_FILE")"
 ensure_linux_service_account
 ensure_macos_service_account
+if [ "$GOOS" = "darwin" ]; then
+  reject_symlink_path "$AGENT_DATA_DIR" "Agent 数据目录"
+  install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 700 "$AGENT_DATA_DIR"
+fi
 assert_regular_file_or_absent "$BIN" "Agent 二进制"
 if [ "$GOOS" = "darwin" ]; then
   assert_regular_file_or_absent "/Library/LaunchDaemons/li.shuijiao.zeno-agent.plist" "LaunchDaemon 配置"

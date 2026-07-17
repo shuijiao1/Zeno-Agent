@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,6 +44,7 @@ type config struct {
 	IdentityRefreshInterval time.Duration
 	NetworkInterfaces       string
 	DiskMounts              string
+	DataDir                 string
 	AllowInsecureHTTP       bool
 	InstallCheck            bool
 	InstallReceiptFile      string
@@ -68,6 +68,7 @@ func main() {
 	flag.DurationVar(&cfg.IdentityRefreshInterval, "identity-refresh-interval", defaultIdentityRefreshInterval, "public IPv4/IPv6 and GeoIP refresh interval; best-effort and cached")
 	flag.StringVar(&cfg.NetworkInterfaces, "network-interfaces", "", "comma-separated network interface allowlist; default excludes virtual/container interfaces")
 	flag.StringVar(&cfg.DiskMounts, "disk-mounts", "", "comma-separated disk mount/path allowlist; default sums real filesystems")
+	flag.StringVar(&cfg.DataDir, "data-dir", defaultAgentDataDir(), "private persistent agent data directory")
 	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "explicitly allow a direct IP controller with an explicit port over HTTP (bearer token is sent in plaintext)")
 	flag.BoolVar(&cfg.InstallCheck, "install-check", false, "validate installer inputs locally without reporting heartbeat or state, then exit")
 	flag.StringVar(&cfg.InstallReceiptFile, "install-receipt-file", "", "installer-only receipt path written after heartbeat and state are accepted")
@@ -158,6 +159,13 @@ func validateInstallReceiptConfig(path, nonce string) error {
 
 func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector, identityDiscoverer networkIdentityDiscoverer) error {
 	normalizeConfigIntervals(&cfg)
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		cfg.DataDir = defaultAgentDataDir()
+	}
+	probeSpool, err := agent.NewProbeSpool(cfg.DataDir, agent.ProbeSpoolOptions{})
+	if err != nil {
+		return fmt.Errorf("initialize probe result spool: %w", err)
+	}
 	probeManager := newProbeTargetManager()
 	receipt := newInstallReceiptTracker(cfg.InstallReceiptFile, cfg.InstallReceiptNonce)
 
@@ -169,6 +177,27 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 		}
 		return refreshProbeTargets(ctx, client, probeManager, requestedVersion)
 	}
+	probeUploader := agent.NewProbeUploader(probeSpool, client, agent.ProbeUploaderOptions{
+		OnRejected: func(uploadCtx context.Context, uploadErr error) {
+			var staleErr *agent.ProbeUploadStaleError
+			if errors.As(uploadErr, &staleErr) {
+				refreshCtx, cancelRefresh := context.WithTimeout(uploadCtx, probeConfigRefreshTimeout)
+				if _, refreshErr := refreshProbeConfig(refreshCtx, 0); refreshErr != nil && uploadCtx.Err() == nil {
+					log.Printf("stale probe result was quarantined; config refresh failed: %v", refreshErr)
+				} else if uploadCtx.Err() == nil {
+					log.Printf("stale probe result was quarantined and probe config refreshed")
+				}
+				cancelRefresh()
+				return
+			}
+			var roundConflict *agent.ProbeUploadRoundConflictError
+			if errors.As(uploadErr, &roundConflict) {
+				log.Printf("conflicting probe round was quarantined; manual diagnosis may be required")
+				return
+			}
+			log.Printf("probe result was terminally rejected and quarantined: %v", uploadErr)
+		},
+	})
 
 	if err := reportHeartbeat(ctx, client, cfg.Version); err != nil {
 		log.Printf("initial heartbeat failed: %v", err)
@@ -189,9 +218,14 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 			log.Printf("initial probe config fetch failed: %v", err)
 		}
 		cancelRefresh()
-		if err := runDueProbes(ctx, client, probeManager); err != nil {
-			log.Printf("initial probe report failed: %v", err)
+		if err := runDueProbes(ctx, probeSpool, probeManager); err != nil {
+			log.Printf("initial probe persistence failed: %v", err)
 		}
+		uploadCtx, cancelUpload := context.WithTimeout(ctx, agent.ProbeUploadTimeout())
+		if err := probeUploader.UploadOne(uploadCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("one-shot probe upload did not complete: %v", err)
+		}
+		cancelUpload()
 		return nil
 	}
 
@@ -209,6 +243,7 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 	}
 	startWorker(func() { client.RunPresence(ctx, refreshProbeConfig) })
 	startWorker(func() { runProbeConfigPoller(ctx, refreshProbeConfig) })
+	startWorker(func() { runProbeUploader(ctx, probeUploader) })
 	startWorker(func() {
 		runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error {
 			err := reportState(ctx, client, collector)
@@ -232,7 +267,7 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 			return reportHost(ctx, client, collector, cfg.Version, identityDiscoverer)
 		}, "host report")
 	})
-	startWorker(func() { runProbeLoop(ctx, client, probeManager) })
+	startWorker(func() { runProbeLoop(ctx, probeSpool, probeManager) })
 
 	<-ctx.Done()
 	// Every worker is context-controlled. Waiting here prevents a service stop
@@ -291,8 +326,8 @@ func runProbeConfigPoller(ctx context.Context, refreshProbeConfig func(context.C
 	}, "probe config refresh")
 }
 
-func runProbeLoop(ctx context.Context, client *agent.Client, manager *probeTargetManager) {
-	call := func(ctx context.Context) error { return runDueProbes(ctx, client, manager) }
+func runProbeLoop(ctx context.Context, spool *agent.ProbeSpool, manager *probeTargetManager) {
+	call := func(ctx context.Context) error { return runDueProbes(ctx, spool, manager) }
 	initialCtx, cancel := context.WithTimeout(ctx, maxProbeRunLoopTimeout())
 	err := call(initialCtx)
 	cancel()
@@ -303,6 +338,23 @@ func runProbeLoop(ctx context.Context, client *agent.Client, manager *probeTarge
 		return
 	}
 	runPeriodicWithTimeout(ctx, probeRunLoopInterval, maxProbeRunLoopTimeout(), call, "probe report")
+}
+
+func runProbeUploader(ctx context.Context, uploader *agent.ProbeUploader) {
+	for ctx.Err() == nil {
+		err := uploader.Run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("probe uploader stopped after local failure: %v", err)
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 type networkIdentityDiscoverer interface {
@@ -499,7 +551,7 @@ func refreshProbeTargets(ctx context.Context, client *agent.Client, manager *pro
 	return response.Version, nil
 }
 
-func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTargetManager) error {
+func runDueProbes(ctx context.Context, spool *agent.ProbeSpool, manager *probeTargetManager) error {
 	if err := manager.beginRun(ctx); err != nil {
 		return err
 	}
@@ -523,27 +575,20 @@ func runDueProbes(ctx context.Context, client *agent.Client, manager *probeTarge
 		log.Printf("probe config changed while probes were running; discarded %d stale result round(s) for version %d", len(rounds), batch.version)
 		return nil
 	}
-	uploadCtx, cancelUpload := context.WithTimeout(ctx, agent.ProbeUploadTimeout())
-	err := client.PostProbeResults(uploadCtx, rounds)
-	cancelUpload()
-	if err != nil {
-		if agent.IsAgentAPIStatus(err, http.StatusConflict) {
-			refreshCtx, cancelRefresh := context.WithTimeout(ctx, 20*time.Second)
-			if _, refreshErr := refreshProbeTargets(refreshCtx, client, manager, batch.version+1); refreshErr != nil {
-				log.Printf("probe result upload returned 409; config refresh failed: %v", refreshErr)
-			}
-			cancelRefresh()
-		}
-		return err
+	if spool == nil {
+		return fmt.Errorf("probe result spool is nil")
+	}
+	if _, err := spool.Enqueue(rounds); err != nil {
+		return fmt.Errorf("persist probe results before scheduler completion: %w", err)
 	}
 	if !manager.markCompleted(batch, time.Now().UTC()) {
-		log.Printf("probe config changed while probe results were uploading; skipped stale completion mark for version %d", batch.version)
+		log.Printf("probe config changed after probe results were persisted; skipped stale completion mark for version %d", batch.version)
 	}
 	return nil
 }
 
 func maxProbeRunLoopTimeout() time.Duration {
-	return time.Duration(120_000)*time.Millisecond + agent.ProbeUploadTimeout() + 5*time.Second
+	return time.Duration(120_000)*time.Millisecond + 5*time.Second
 }
 
 func sameProbeTargets(left, right []agent.ProbeTarget) bool {

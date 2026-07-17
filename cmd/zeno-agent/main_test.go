@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -97,34 +98,21 @@ func (d staticIdentityDiscoverer) Discover(context.Context) agent.NetworkIdentit
 
 func TestRunDueProbesDiscardsStaleGenerationBeforeUpload(t *testing.T) {
 	manager := newProbeTargetManager()
-	var probePosts atomic.Int64
 	slowStarted := make(chan struct{})
 	releaseSlowProbe := make(chan struct{})
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/slow":
-			select {
-			case <-slowStarted:
-			default:
-				close(slowStarted)
-			}
-			<-releaseSlowProbe
-			w.WriteHeader(http.StatusNoContent)
-		case "/api/agent/v1/probe-results":
-			probePosts.Add(1)
-			w.WriteHeader(http.StatusAccepted)
-		default:
+		if r.URL.Path != "/slow" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
+		close(slowStarted)
+		<-releaseSlowProbe
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "http_get", Address: server.URL + "/slow", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
-	client := agent.NewClient(server.URL, "hytron", "token")
+	spool := newMainTestSpool(t)
 	errCh := make(chan error, 1)
-	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
-
+	go func() { errCh <- runDueProbes(context.Background(), spool, manager) }()
 	select {
 	case <-slowStarted:
 	case <-time.After(time.Second):
@@ -132,53 +120,38 @@ func TestRunDueProbesDiscardsStaleGenerationBeforeUpload(t *testing.T) {
 	}
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
 	close(releaseSlowProbe)
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("runDueProbes: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runDueProbes did not return")
+	if err := <-errCh; err != nil {
+		t.Fatalf("runDueProbes: %v", err)
 	}
-	if got := probePosts.Load(); got != 0 {
-		t.Fatalf("probe result posts = %d, want stale generation discarded before upload", got)
+	if item, err := spool.Next(time.Now().UTC()); err != nil || item != nil {
+		t.Fatalf("stale generation was persisted: %#v, %v", item, err)
 	}
 	batch := manager.due(time.Now().UTC())
 	if len(batch.targets) != 1 || batch.targets[0].ID != "new" || batch.version != 2 {
-		t.Fatalf("due batch after generation update = %+v, want new version target still due", batch)
+		t.Fatalf("due batch = %+v", batch)
 	}
 }
 
-func TestRunDueProbesPostsConfigVersionAndSkipsStaleCompletion(t *testing.T) {
+func TestRunDueProbesPersistsConfigVersionBeforeCompletion(t *testing.T) {
 	manager := newProbeTargetManager()
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/agent/v1/probe-results":
-			var payload agent.ProbeResultsRequest
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatalf("decode probe results: %v", err)
-			}
-			if payload.ConfigVersion != 1 || len(payload.Rounds) != 1 {
-				t.Fatalf("probe result payload = %+v, want config version 1", payload)
-			}
-			mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 2)
-			w.WriteHeader(http.StatusAccepted)
-		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	client := agent.NewClient(server.URL, "hytron", "token")
-	if err := runDueProbes(context.Background(), client, manager); err != nil {
+	spool := newMainTestSpool(t)
+	if err := runDueProbes(context.Background(), spool, manager); err != nil {
 		t.Fatalf("runDueProbes: %v", err)
 	}
-	batch := manager.due(time.Now().UTC())
-	if len(batch.targets) != 1 || batch.targets[0].ID != "same" || batch.version != 2 {
-		t.Fatalf("due batch after generation update during upload = %+v, want version 2 target still due", batch)
+	item, err := spool.Next(time.Now().UTC())
+	if err != nil || item == nil {
+		t.Fatalf("persisted item = %#v, %v", item, err)
+	}
+	var payload agent.ProbeResultsRequest
+	if err := json.Unmarshal(item.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ConfigVersion != 1 || len(payload.Rounds) != 1 {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if due := manager.due(time.Now().UTC()); len(due.targets) != 0 {
+		t.Fatalf("scheduler was not marked after enqueue: %+v", due)
 	}
 }
 
@@ -221,6 +194,15 @@ func TestRefreshProbeTargetsRequiresRequestedConfigVersion(t *testing.T) {
 	if applied, err := refreshProbeTargets(context.Background(), client, manager, 8); err == nil || applied != 0 {
 		t.Fatalf("version zero refresh applied=%d err=%v, want rejected", applied, err)
 	}
+}
+
+func newMainTestSpool(t *testing.T) *agent.ProbeSpool {
+	t.Helper()
+	spool, err := agent.NewProbeSpool(t.TempDir(), agent.ProbeSpoolOptions{FreeBytes: func(string) (uint64, error) { return 1 << 40, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spool
 }
 
 func mustUpdateProbeTargets(t *testing.T, manager *probeTargetManager, targets []agent.ProbeTarget, version int64) {
@@ -280,14 +262,16 @@ func TestProbeTargetManagerRejectsRollbackZeroAndSameVersionDrift(t *testing.T) 
 	}
 }
 
-func TestRunDueProbesRefreshesProbeConfigOnUploadConflict(t *testing.T) {
+func TestProbeUploaderRefreshesConfigOnlyForStaleConflict(t *testing.T) {
 	manager := newProbeTargetManager()
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 1)
 	var fetches atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agent/v1/probe-results":
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"stale_probe_config"}`))
 		case "/api/agent/v1/probe-targets":
 			fetches.Add(1)
 			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 2, Targets: []agent.ProbeTarget{{ID: "new", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}})
@@ -296,87 +280,85 @@ func TestRunDueProbesRefreshesProbeConfigOnUploadConflict(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	client := agent.NewClient(server.URL, "hytron", "token")
-	if err := runDueProbes(context.Background(), client, manager); err == nil {
-		t.Fatal("runDueProbes returned nil, want upload conflict")
+	spool := newMainTestSpool(t)
+	if _, err := spool.Enqueue([]agent.ProbeRound{{RoundID: "old-round", ConfigVersion: 1, TargetID: "old", TS: time.Now().UTC(), Type: "tcping", Samples: []agent.ProbeSample{{Seq: 1}}}}); err != nil {
+		t.Fatal(err)
 	}
+	refreshed := make(chan struct{})
+	uploader := agent.NewProbeUploader(spool, client, agent.ProbeUploaderOptions{OnRejected: func(ctx context.Context, err error) {
+		var stale *agent.ProbeUploadStaleError
+		if errors.As(err, &stale) {
+			_, _ = refreshProbeTargets(ctx, client, manager, 0)
+			close(refreshed)
+		}
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- uploader.Run(ctx) }()
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("uploader did not refresh stale config")
+	}
+	cancel()
+	<-done
 	if fetches.Load() != 1 {
-		t.Fatalf("probe config fetches after 409 = %d, want 1", fetches.Load())
+		t.Fatalf("fetches = %d", fetches.Load())
 	}
 	batch := manager.due(time.Now().UTC())
 	if batch.version != 2 || len(batch.targets) != 1 || batch.targets[0].ID != "new" {
-		t.Fatalf("manager after 409 refresh = %+v, want version 2 new target", batch)
+		t.Fatalf("manager = %+v", batch)
 	}
 }
 
-func TestRunDueProbesMarksSchedulerCompletionAfterUpload(t *testing.T) {
+func TestRunDueProbesDoesNotMarkSchedulerWhenEnqueueFails(t *testing.T) {
 	manager := newProbeTargetManager()
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 5}}, 1)
-	uploadDelay := 300 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/agent/v1/probe-results" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		time.Sleep(uploadDelay)
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer server.Close()
-
-	client := agent.NewClient(server.URL, "hytron", "token")
-	before := time.Now().UTC()
-	if err := runDueProbes(context.Background(), client, manager); err != nil {
-		t.Fatalf("runDueProbes: %v", err)
+	spool, err := agent.NewProbeSpool(t.TempDir(), agent.ProbeSpoolOptions{FreeBytes: func(string) (uint64, error) { return 1 << 40, nil }, AtomicWrite: func(string, []byte) error { return syscall.ENOSPC }})
+	if err != nil {
+		t.Fatal(err)
 	}
-	batch := manager.due(before.Add(5*time.Second + uploadDelay/2))
-	if len(batch.targets) != 0 {
-		t.Fatalf("target due too early after upload-delayed completion mark: %+v", batch)
+	if err := runDueProbes(context.Background(), spool, manager); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("runDueProbes error = %v", err)
+	}
+	if due := manager.due(time.Now().UTC()); len(due.targets) != 1 {
+		t.Fatalf("enqueue failure marked scheduler complete: %+v", due)
 	}
 }
 
 func TestRunDueProbesSerializesConcurrentInvocations(t *testing.T) {
 	manager := newProbeTargetManager()
-	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
-	var uploads atomic.Int64
-	firstUploadStarted := make(chan struct{})
-	releaseFirstUpload := make(chan struct{})
-	var startedOnce sync.Once
+	var probes atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/agent/v1/probe-results" {
-			t.Errorf("unexpected path %s", r.URL.Path)
-			http.NotFound(w, r)
-			return
-		}
-		uploads.Add(1)
-		startedOnce.Do(func() { close(firstUploadStarted) })
-		<-releaseFirstUpload
-		w.WriteHeader(http.StatusAccepted)
+		probes.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-
-	client := agent.NewClient(server.URL, "hytron", "token")
+	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "same", Type: "http_get", Address: server.URL, Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}, 1)
+	spool := newMainTestSpool(t)
 	errCh := make(chan error, 2)
-	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
-	select {
-	case <-firstUploadStarted:
-	case <-time.After(time.Second):
-		t.Fatal("first probe upload did not start")
-	}
-	go func() { errCh <- runDueProbes(context.Background(), client, manager) }()
-	// Give the second invocation time to contend for the run gate. It must not
-	// obtain the same due batch and start a duplicate upload.
+	go func() { errCh <- runDueProbes(context.Background(), spool, manager) }()
+	<-started
+	go func() { errCh <- runDueProbes(context.Background(), spool, manager) }()
 	time.Sleep(30 * time.Millisecond)
-	if got := uploads.Load(); got != 1 {
-		t.Fatalf("uploads while first run is blocked = %d, want exactly 1", got)
+	if probes.Load() != 1 {
+		t.Fatalf("concurrent probes = %d", probes.Load())
 	}
-	close(releaseFirstUpload)
+	close(release)
 	for range 2 {
 		if err := <-errCh; err != nil {
-			t.Fatalf("runDueProbes: %v", err)
+			t.Fatal(err)
 		}
 	}
-	if got := uploads.Load(); got != 1 {
-		t.Fatalf("total uploads from concurrent runs = %d, want exactly 1", got)
+	if probes.Load() != 1 {
+		t.Fatalf("total probes = %d", probes.Load())
 	}
 }
 
@@ -413,22 +395,33 @@ func TestProbeConfigPollerRetriesWhenPresenceIsUnavailable(t *testing.T) {
 
 func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.T) {
 	oldProbeInterval := probeRunLoopInterval
+	oldConfigPollInterval := probeConfigPollInterval
 	probeRunLoopInterval = 10 * time.Millisecond
-	t.Cleanup(func() { probeRunLoopInterval = oldProbeInterval })
+	probeConfigPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		probeRunLoopInterval = oldProbeInterval
+		probeConfigPollInterval = oldConfigPollInterval
+	})
 
 	var heartbeatPosts atomic.Int64
 	var statePosts atomic.Int64
+	var hostPosts atomic.Int64
 	probeUploadStarted := make(chan struct{})
 	releaseProbeUpload := make(chan struct{})
+	secondProbeScheduled := make(chan struct{})
 	secondHeartbeat := make(chan struct{})
 	secondState := make(chan struct{})
+	secondHost := make(chan struct{})
 	presenceAttempt := make(chan struct{})
 	var probeStartedOnce sync.Once
+	var scheduledOnce sync.Once
 	var heartbeatOnce sync.Once
 	var stateOnce sync.Once
+	var hostOnce sync.Once
 	var presenceOnce sync.Once
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agent/v1/heartbeat":
 			if heartbeatPosts.Add(1) >= 2 {
@@ -441,9 +434,20 @@ func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.
 			}
 			w.WriteHeader(http.StatusAccepted)
 		case "/api/agent/v1/host":
+			if hostPosts.Add(1) >= 2 {
+				hostOnce.Do(func() { close(secondHost) })
+			}
 			w.WriteHeader(http.StatusAccepted)
 		case "/api/agent/v1/probe-targets":
-			_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 1, Targets: []agent.ProbeTarget{{ID: "slow-upload", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}})
+			select {
+			case <-probeUploadStarted:
+				_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 2, Targets: []agent.ProbeTarget{{ID: "second-probe", Type: "http_get", Address: server.URL + "/scheduled-probe", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}})
+			default:
+				_ = json.NewEncoder(w).Encode(agent.ProbeTargetsResponse{Version: 1, Targets: []agent.ProbeTarget{{ID: "slow-upload", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 3600}}})
+			}
+		case "/scheduled-probe":
+			scheduledOnce.Do(func() { close(secondProbeScheduled) })
+			w.WriteHeader(http.StatusNoContent)
 		case "/api/agent/v1/probe-results":
 			probeStartedOnce.Do(func() { close(probeUploadStarted) })
 			select {
@@ -466,9 +470,10 @@ func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.
 	cfg := config{
 		StateInterval:           10 * time.Millisecond,
 		HeartbeatInterval:       10 * time.Millisecond,
-		HostInterval:            time.Hour,
+		HostInterval:            10 * time.Millisecond,
 		IdentityRefreshInterval: time.Hour,
 		Version:                 "startup-test",
+		DataDir:                 t.TempDir(),
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -481,7 +486,7 @@ func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.
 		cancel()
 		t.Fatal("initial probe upload did not start")
 	}
-	for label, signal := range map[string]<-chan struct{}{"heartbeat": secondHeartbeat, "state": secondState, "presence": presenceAttempt} {
+	for label, signal := range map[string]<-chan struct{}{"heartbeat": secondHeartbeat, "state": secondState, "host": secondHost, "probe scheduler": secondProbeScheduled, "presence": presenceAttempt} {
 		select {
 		case <-signal:
 		case <-time.After(time.Second):
