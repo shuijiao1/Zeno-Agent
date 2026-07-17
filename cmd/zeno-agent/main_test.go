@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,8 +79,11 @@ func TestInstallReceiptRequiresBothAcceptedReportsAndContainsNoToken(t *testing.
 		t.Fatal("receipt contains credential-like material")
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("receipt mode = %v, err=%v", info.Mode().Perm(), err)
+	if err != nil {
+		t.Fatalf("stat receipt: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("receipt mode = %v, want 0600", info.Mode().Perm())
 	}
 }
 
