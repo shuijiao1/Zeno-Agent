@@ -21,6 +21,7 @@ func TestUnixRunConsoleHandlesSIGTERMAsCleanShutdown(t *testing.T) {
 			ControllerURL:           os.Getenv("ZENO_SIGTERM_CONTROLLER"),
 			NodeID:                  "signal-test",
 			Token:                   "signal-token",
+			DataDir:                 os.Getenv("ZENO_SIGTERM_DATA_DIR"),
 			StateInterval:           time.Hour,
 			HeartbeatInterval:       time.Hour,
 			HostInterval:            time.Hour,
@@ -44,7 +45,11 @@ func TestUnixRunConsoleHandlesSIGTERMAsCleanShutdown(t *testing.T) {
 	defer server.Close()
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestUnixRunConsoleHandlesSIGTERMAsCleanShutdown$")
-	cmd.Env = append(os.Environ(), "ZENO_SIGTERM_HELPER=1", "ZENO_SIGTERM_CONTROLLER="+server.URL)
+	cmd.Env = append(os.Environ(),
+		"ZENO_SIGTERM_HELPER=1",
+		"ZENO_SIGTERM_CONTROLLER="+server.URL,
+		"ZENO_SIGTERM_DATA_DIR="+t.TempDir(),
+	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
