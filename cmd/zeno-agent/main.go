@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,6 @@ const defaultHostInterval = 30 * time.Minute
 const defaultIdentityRefreshInterval = 12 * time.Hour
 const defaultProbeConfigPollInterval = time.Minute
 const probeConfigRefreshTimeout = 20 * time.Second
-const installCheckTimeout = 30 * time.Second
 
 var probeConfigPollInterval = defaultProbeConfigPollInterval
 var probeRunLoopInterval = time.Second
@@ -47,6 +47,8 @@ type config struct {
 	DiskMounts              string
 	AllowInsecureHTTP       bool
 	InstallCheck            bool
+	InstallReceiptFile      string
+	InstallReceiptNonce     string
 	LogFile                 string
 }
 
@@ -67,7 +69,9 @@ func main() {
 	flag.StringVar(&cfg.NetworkInterfaces, "network-interfaces", "", "comma-separated network interface allowlist; default excludes virtual/container interfaces")
 	flag.StringVar(&cfg.DiskMounts, "disk-mounts", "", "comma-separated disk mount/path allowlist; default sums real filesystems")
 	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "explicitly allow a direct IP controller with an explicit port over HTTP (bearer token is sent in plaintext)")
-	flag.BoolVar(&cfg.InstallCheck, "install-check", false, "verify that the controller accepts one heartbeat and one state report, then exit")
+	flag.BoolVar(&cfg.InstallCheck, "install-check", false, "validate installer inputs locally without reporting heartbeat or state, then exit")
+	flag.StringVar(&cfg.InstallReceiptFile, "install-receipt-file", "", "installer-only receipt path written after heartbeat and state are accepted")
+	flag.StringVar(&cfg.InstallReceiptNonce, "install-receipt-nonce", "", "installer-only non-secret receipt nonce")
 	flag.StringVar(&cfg.LogFile, "log-file", "", "write logs to this file, reopening it for every record so external rotation is safe")
 	flag.Parse()
 	if legacyInterval > 0 {
@@ -120,23 +124,34 @@ func run(ctx context.Context, cfg config) error {
 	if err := agent.ValidateControllerURLWithOptions(cfg.ControllerURL, cfg.AllowInsecureHTTP); err != nil {
 		return err
 	}
+	if strings.TrimSpace(cfg.NodeID) == "" || strings.TrimSpace(cfg.Token) == "" {
+		return fmt.Errorf("node id and agent token must be non-empty")
+	}
+	if err := validateInstallReceiptConfig(cfg.InstallReceiptFile, cfg.InstallReceiptNonce); err != nil {
+		return err
+	}
+	// install-check is deliberately local-only. An elevated installer must not
+	// impersonate the eventual service by posting heartbeat/state itself.
+	if cfg.InstallCheck {
+		return nil
+	}
 	client := agent.NewClientWithOptions(cfg.ControllerURL, cfg.NodeID, cfg.Token, agent.ClientOptions{AllowInsecureHTTP: cfg.AllowInsecureHTTP})
 	collector := agent.NewMetricsCollector(agent.MetricsOptions{NetworkInterfaceAllowlist: splitCommaList(cfg.NetworkInterfaces), DiskMountAllowlist: splitCommaList(cfg.DiskMounts)})
-	if cfg.InstallCheck {
-		return verifyController(ctx, cfg, client, collector)
-	}
 	identityDiscoverer := agent.NewCachedNetworkIdentityDiscoverer(agent.NewNetworkIdentityDiscoverer(), cfg.IdentityRefreshInterval)
 	return runAgent(ctx, cfg, client, collector, identityDiscoverer)
 }
 
-func verifyController(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector) error {
-	checkCtx, cancel := context.WithTimeout(ctx, installCheckTimeout)
-	defer cancel()
-	if err := reportHeartbeat(checkCtx, client, cfg.Version); err != nil {
-		return fmt.Errorf("controller heartbeat install check failed: %w", err)
+func validateInstallReceiptConfig(path, nonce string) error {
+	if path == "" && nonce == "" {
+		return nil
 	}
-	if err := reportState(checkCtx, client, collector); err != nil {
-		return fmt.Errorf("controller state install check failed: %w", err)
+	if path == "" || nonce == "" || !filepath.IsAbs(path) || len(nonce) != 64 {
+		return fmt.Errorf("invalid install receipt configuration")
+	}
+	for _, ch := range nonce {
+		if !strings.ContainsRune("0123456789abcdef", ch) {
+			return fmt.Errorf("invalid install receipt configuration")
+		}
 	}
 	return nil
 }
@@ -144,6 +159,7 @@ func verifyController(ctx context.Context, cfg config, client *agent.Client, col
 func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *agent.MetricsCollector, identityDiscoverer networkIdentityDiscoverer) error {
 	normalizeConfigIntervals(&cfg)
 	probeManager := newProbeTargetManager()
+	receipt := newInstallReceiptTracker(cfg.InstallReceiptFile, cfg.InstallReceiptNonce)
 
 	refreshProbeConfig := func(ctx context.Context, requestedVersion int64) (int64, error) {
 		if requestedVersion > 0 {
@@ -156,12 +172,16 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 
 	if err := reportHeartbeat(ctx, client, cfg.Version); err != nil {
 		log.Printf("initial heartbeat failed: %v", err)
+	} else {
+		receipt.markHeartbeat()
 	}
 	if err := reportHost(ctx, client, collector, cfg.Version, identityDiscoverer); err != nil {
 		log.Printf("initial host report failed: %v", err)
 	}
 	if err := reportState(ctx, client, collector); err != nil {
 		log.Printf("initial state report failed: %v", err)
+	} else {
+		receipt.markState()
 	}
 	if cfg.Once {
 		refreshCtx, cancelRefresh := context.WithTimeout(ctx, probeConfigRefreshTimeout)
@@ -190,10 +210,22 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 	startWorker(func() { client.RunPresence(ctx, refreshProbeConfig) })
 	startWorker(func() { runProbeConfigPoller(ctx, refreshProbeConfig) })
 	startWorker(func() {
-		runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error { return reportState(ctx, client, collector) }, "state report")
+		runPeriodic(ctx, cfg.StateInterval, func(ctx context.Context) error {
+			err := reportState(ctx, client, collector)
+			if err == nil {
+				receipt.markState()
+			}
+			return err
+		}, "state report")
 	})
 	startWorker(func() {
-		runPeriodic(ctx, cfg.HeartbeatInterval, func(ctx context.Context) error { return reportHeartbeat(ctx, client, cfg.Version) }, "heartbeat report")
+		runPeriodic(ctx, cfg.HeartbeatInterval, func(ctx context.Context) error {
+			err := reportHeartbeat(ctx, client, cfg.Version)
+			if err == nil {
+				receipt.markHeartbeat()
+			}
+			return err
+		}, "heartbeat report")
 	})
 	startWorker(func() {
 		runPeriodic(ctx, cfg.HostInterval, func(ctx context.Context) error {

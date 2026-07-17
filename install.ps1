@@ -27,6 +27,8 @@ $DiskMounts = $env:ZENO_AGENT_DISK_MOUNTS
 $ServiceName = 'zeno-agent'
 $AllowInsecureHTTPRequested = $env:ZENO_ALLOW_INSECURE_HTTP -eq '1'
 $AllowInsecureHTTP = $false
+$InstallReceiptTimeout = if ($env:ZENO_AGENT_INSTALL_RECEIPT_TIMEOUT) { [int]$env:ZENO_AGENT_INSTALL_RECEIPT_TIMEOUT } else { 45 }
+$InstallReceiptPrefix = 'zeno-agent-install-receipt-v1'
 
 function Fail($Message) {
   throw "错误: $Message"
@@ -302,6 +304,52 @@ function Wait-ServiceRunning($Name) {
   return $false
 }
 
+function Set-ServiceReceiptDirectoryAcl($Path, $Name) {
+  New-Item -ItemType Directory -Force -Path $Path | Out-Null
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  $none = [Security.AccessControl.PropagationFlags]::None
+  foreach ($entry in @(
+    @{ Identity = 'NT AUTHORITY\SYSTEM'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+    @{ Identity = 'BUILTIN\Administrators'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+    @{ Identity = "NT SERVICE\$Name"; Rights = [Security.AccessControl.FileSystemRights]::Modify }
+  )) {
+    $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+      $entry.Identity, $entry.Rights, $inherit, $none, [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($rule)
+  }
+  $acl.SetOwner((New-Object Security.Principal.NTAccount('BUILTIN\Administrators')))
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Wait-ServiceInstallReceipt($Name, $Path, $Nonce, $ExpectedAccount, $TimeoutSeconds) {
+  $expectedSid = Convert-ToSidString $ExpectedAccount
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+    if (-not $service -or $service.State -ne 'Running' -or [uint32]$service.ProcessId -eq 0) {
+      Fail 'Zeno Agent SCM 服务在回执前退出，准备回滚'
+    }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      $content = [IO.File]::ReadAllText($Path).TrimEnd([char[]]"`r`n")
+      if ($content -ne "$InstallReceiptPrefix $Nonce") { Fail '安装回执内容无效，准备回滚' }
+      $ownerSid = (New-Object Security.Principal.NTAccount((Get-Acl -LiteralPath $Path).Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+      if ($ownerSid -ne $expectedSid) { Fail '安装回执并非由实际服务账户创建，准备回滚' }
+      $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($service.ProcessId)" -ErrorAction Stop
+      $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction Stop
+      if ($owner.ReturnValue -ne 0) { Fail '无法读取 SCM 服务进程身份，准备回滚' }
+      $processAccount = if ($owner.Domain) { "$($owner.Domain)\$($owner.User)" } else { [string]$owner.User }
+      if ((Convert-ToSidString $processAccount) -ne $expectedSid) { Fail 'SCM 服务进程未以预期低权限身份运行，准备回滚' }
+      Remove-Item -Force -LiteralPath $Path
+      return
+    }
+    Start-Sleep -Seconds 1
+  }
+  Fail '等待低权限 SCM 服务 heartbeat/state 回执超时，准备回滚'
+}
+
 function Stop-ServiceAndWait($Name) {
   $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
   if (-not $svc) { return $true }
@@ -538,6 +586,9 @@ $RecoveryBackupPath = $null
 $InstallSucceeded = $false
 $EnrollmentExchangeSucceeded = $false
 $EnrollmentTokenInstalled = $false
+$InstallReceiptNonce = $null
+$InstallReceiptDir = $null
+$InstallReceiptFile = $null
 try {
   $Archive = Join-Path $Temp $Asset
   $Sums = Join-Path $Temp 'SHA256SUMS'
@@ -663,8 +714,14 @@ try {
   $CheckArgs = @($Args) + @('-install-check')
   & $Bin @CheckArgs
   if ($LASTEXITCODE -ne 0) {
-    Fail 'Controller 未确认收到该 node 的 heartbeat/state，准备回滚'
+    Fail 'Agent 本地安装预检失败，准备回滚'
   }
+  if ($InstallReceiptTimeout -le 0) { Fail 'ZENO_AGENT_INSTALL_RECEIPT_TIMEOUT 必须为正整数秒' }
+  $InstallReceiptNonce = ([Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N'))
+  $InstallReceiptDir = Join-Path $env:ProgramData 'Zeno\install-receipts'
+  $InstallReceiptFile = Join-Path $InstallReceiptDir ("install-receipt-$InstallReceiptNonce")
+  Remove-Item -Force -LiteralPath $InstallReceiptFile -ErrorAction SilentlyContinue
+  $Args += @('-install-receipt-file', $InstallReceiptFile, '-install-receipt-nonce', $InstallReceiptNonce)
   $BinPath = Join-WindowsCommandLine -FilePath $Bin -Arguments $Args
 
   if ($Existing) {
@@ -720,6 +777,8 @@ try {
     Fail 'Zeno Agent 服务最小权限列表未生效'
   }
 
+  Set-ServiceReceiptDirectoryAcl -Path $InstallReceiptDir -Name $ServiceName
+
   Set-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
 
@@ -727,6 +786,8 @@ try {
   if (-not (Wait-ServiceRunning -Name $ServiceName)) { Fail 'Zeno Agent 服务未进入 Running 状态' }
 
   Assert-StrictTokenAcl -Path $TokenFile -ServiceName $ServiceName
+  $EffectiveService = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+  Wait-ServiceInstallReceipt -Name $ServiceName -Path $InstallReceiptFile -Nonce $InstallReceiptNonce -ExpectedAccount ([string]$EffectiveService.StartName) -TimeoutSeconds $InstallReceiptTimeout
   if ($BackupBin) {
     try {
       Remove-OldBinaryBackups -Destination $Bin -Keep 3
@@ -859,6 +920,9 @@ try {
   [Console]::Error.WriteLine("原始错误: $installError")
   exit 1
 } finally {
+  if ($InstallReceiptFile) {
+    Remove-Item -Force -LiteralPath $InstallReceiptFile -ErrorAction SilentlyContinue
+  }
   if ($InstallSucceeded -and $BackupToken -and (Test-Path -LiteralPath $BackupToken -PathType Leaf)) {
     Remove-Item -Force -LiteralPath $BackupToken -ErrorAction SilentlyContinue
   }

@@ -28,6 +28,8 @@ ALLOW_INSECURE_HTTP_REQUESTED="${ZENO_ALLOW_INSECURE_HTTP:-0}"
 MACOS_LOG_FILE="/var/log/zeno-agent.log"
 MACOS_NEWSYSLOG_CONFIG="/etc/newsyslog.d/zeno-agent.conf"
 MACOS_NEWSYSLOG_MARKER="# Managed by Zeno Agent installer"
+INSTALL_RECEIPT_TIMEOUT="${ZENO_AGENT_INSTALL_RECEIPT_TIMEOUT:-45}"
+INSTALL_RECEIPT_PREFIX="zeno-agent-install-receipt-v1"
 
 fail() {
   echo "错误: $*" >&2
@@ -376,6 +378,14 @@ generate_runtime_token() {
   case "$generated" in
     *[!0-9a-f]*) fail "生成 Agent runtime token 失败" ;;
   esac
+  printf '%s' "$generated"
+}
+
+generate_install_receipt_nonce() {
+  local generated
+  generated=$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#generated}" -eq 64 ] || fail "生成安装回执 nonce 失败"
+  case "$generated" in *[!0-9a-f]*) fail "生成安装回执 nonce 失败" ;; esac
   printf '%s' "$generated"
 }
 
@@ -869,7 +879,42 @@ run_agent_install_check() {
     check_args+=(-allow-insecure-http)
   fi
   check_args+=("${extra_args[@]}")
-  "$BIN" "${check_args[@]}" || fail "Controller 未确认收到该 node 的 heartbeat/state，准备回滚"
+  "$BIN" "${check_args[@]}" || fail "Agent 本地安装预检失败，准备回滚"
+}
+
+wait_for_service_install_receipt() {
+  local deadline now receipt expected_uid expected_gid pid process_uid
+  receipt="$install_receipt_file"
+  expected_uid=$(id -u "$SERVICE_USER")
+  expected_gid=$(id -g "$SERVICE_USER")
+  deadline=$(( $(date +%s) + INSTALL_RECEIPT_TIMEOUT ))
+  while :; do
+    if [ -e "$receipt" ]; then
+      [ ! -L "$receipt" ] && [ -f "$receipt" ] || fail "安装回执不是普通文件，准备回滚"
+      [ "$(cat "$receipt")" = "$INSTALL_RECEIPT_PREFIX $install_receipt_nonce" ] || fail "安装回执内容无效，准备回滚"
+      [ "$(file_owner_mode "$receipt")" = "$expected_uid:$expected_gid:600" ] || fail "安装回执并非由低权限服务账户创建，准备回滚"
+      if [ "$GOOS" = "linux" ]; then
+        pid=$(systemctl show --property=MainPID --value "$SERVICE_NAME.service" 2>/dev/null || true)
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "systemd 未报告有效服务进程，准备回滚"
+        process_uid=$(awk '/^Uid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null || true)
+      else
+        pid=$(launchctl print system/li.shuijiao.zeno-agent 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }')
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "launchd 未报告有效服务进程，准备回滚"
+        process_uid=$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')
+      fi
+      [ "$process_uid" = "$expected_uid" ] || fail "服务进程未以预期低权限身份运行，准备回滚"
+      rm -f "$receipt"
+      return 0
+    fi
+    now=$(date +%s)
+    [ "$now" -lt "$deadline" ] || fail "等待低权限服务 heartbeat/state 回执超时，准备回滚"
+    if [ "$GOOS" = "linux" ]; then
+      systemctl is-active --quiet "$SERVICE_NAME.service" || fail "Zeno Agent 服务在回执前退出，准备回滚"
+    else
+      launchctl print system/li.shuijiao.zeno-agent >/dev/null 2>&1 || fail "Zeno Agent LaunchDaemon 在回执前退出，准备回滚"
+    fi
+    sleep 1
+  done
 }
 
 install_linux_service() {
@@ -888,6 +933,8 @@ install_linux_service() {
     -host-interval "$HOST_INTERVAL" \
     -identity-refresh-interval "$IDENTITY_REFRESH_INTERVAL" \
     -version "$VERSION" \
+    -install-receipt-file "$install_receipt_file" \
+    -install-receipt-nonce "$install_receipt_nonce" \
     "${insecure_args[@]}" \
     "${extra_args[@]}")
 
@@ -945,6 +992,8 @@ SystemCallArchitectures=native
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=CAP_NET_RAW
 AmbientCapabilities=CAP_NET_RAW
+RuntimeDirectory=zeno-agent
+RuntimeDirectoryMode=0700
 UMask=0077
 
 [Install]
@@ -1087,6 +1136,8 @@ install_macos_service() {
     <string>-host-interval</string><string>$(xml_escape "$HOST_INTERVAL")</string>
     <string>-identity-refresh-interval</string><string>$(xml_escape "$IDENTITY_REFRESH_INTERVAL")</string>
     <string>-version</string><string>$(xml_escape "$VERSION")</string>
+    <string>-install-receipt-file</string><string>$(xml_escape "$install_receipt_file")</string>
+    <string>-install-receipt-nonce</string><string>$(xml_escape "$install_receipt_nonce")</string>
     <string>-log-file</string><string>$(xml_escape "$MACOS_LOG_FILE")</string>
 ${plist_extra_args}
   </array>
@@ -1198,6 +1249,8 @@ service_user_created=0
 service_group_created=0
 created_service_uid=""
 created_service_gid=""
+install_receipt_nonce=""
+install_receipt_file=""
 macos_newsyslog_config_existed=0
 macos_newsyslog_config_backup=""
 macos_logging_installed=0
@@ -1366,6 +1419,9 @@ cleanup() {
       cleanup_status=1
     fi
   fi
+  if [ -n "$install_receipt_file" ]; then
+    rm -f "$install_receipt_file" 2>/dev/null || true
+  fi
   rm -rf "$TMP"
   return "$cleanup_status"
 }
@@ -1464,11 +1520,21 @@ fi
 atomic_install_binary "$FOUND" "$BIN" backup_bin
 run_agent_install_check
 
+[[ "$INSTALL_RECEIPT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || fail "ZENO_AGENT_INSTALL_RECEIPT_TIMEOUT 必须为正整数秒"
+install_receipt_nonce=$(generate_install_receipt_nonce)
+if [ "$GOOS" = "darwin" ]; then
+  install_receipt_file="/var/tmp/zeno-agent-install-receipt-$install_receipt_nonce"
+else
+  install_receipt_file="/run/zeno-agent/install-receipt-$install_receipt_nonce"
+fi
+rm -f "$install_receipt_file"
+
 if [ "$GOOS" = "darwin" ]; then
   install_macos_service
 else
   install_linux_service
 fi
+wait_for_service_install_receipt
 install_committed=1
 
 if [ -n "$backup_bin" ]; then

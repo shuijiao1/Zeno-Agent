@@ -27,6 +27,7 @@ var probeRoundSequence atomic.Uint64
 
 const (
 	drawableLatencyCap = 5 * time.Second
+	pingCommandGrace   = 250 * time.Millisecond
 
 	maxProbeTargets           = 32
 	maxProbeCount             = 32
@@ -162,7 +163,7 @@ func RunTCPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 		elapsedMS := float64(time.Since(start).Microseconds()) / 1000
 		cancel()
 		if err != nil {
-			samples = append(samples, failedMeasuredProbeSample(seq, elapsedMS, classifyProbeError(err)))
+			samples = append(samples, failedMeasuredProbeSample(seq, classifyProbeError(err)))
 			continue
 		}
 		_ = conn.Close()
@@ -201,7 +202,7 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 		default:
 		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, observationTimeout+time.Second)
+		attemptCtx, cancel := context.WithTimeout(ctx, probeAttemptBudget(target))
 		start := time.Now()
 		// Keep resolved addresses as netip.Addr values until command selection so
 		// an IPv6 result cannot accidentally be sent to the IPv4 ping utility.
@@ -222,7 +223,7 @@ func RunPingProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 		ctxErr := attemptCtx.Err()
 		cancel()
 		if err != nil {
-			samples = append(samples, failedMeasuredProbeSample(seq, elapsedMS, classifyPingError(err, string(output), ctxErr)))
+			samples = append(samples, failedMeasuredProbeSample(seq, classifyPingError(err, string(output), ctxErr)))
 			continue
 		}
 		latency := elapsedMS
@@ -275,7 +276,7 @@ func RunHTTPProbe(ctx context.Context, target ProbeTarget) []ProbeSample {
 		ctxErr := attemptCtx.Err()
 		cancel()
 		if err != nil {
-			samples = append(samples, failedMeasuredProbeSample(seq, elapsedMS, classifyHTTPProbeError(err, ctxErr)))
+			samples = append(samples, failedMeasuredProbeSample(seq, classifyHTTPProbeError(err, ctxErr)))
 			continue
 		}
 		if response.Request == nil {
@@ -340,31 +341,43 @@ func normalizedProbeIntervalSec(intervalSec int) int {
 }
 
 func latencyObservationTimeout(timeout time.Duration) time.Duration {
-	// Five seconds is both the chart cap and the hard observation ceiling.
-	// Shorter configured timeouts still get the full observation window so a
-	// 1–5s timeout can retain its measured latency, but no probe may block the
-	// scheduler indefinitely because of an oversized target timeout.
-	return drawableLatencyCap
+	// timeout_ms is an execution deadline, not merely a success threshold.
+	// Normalization already clamps it to the supported 100ms..5s range.
+	if timeout <= 0 {
+		return time.Duration(defaultProbeTimeoutMS) * time.Millisecond
+	}
+	if timeout > drawableLatencyCap {
+		return drawableLatencyCap
+	}
+	return timeout
 }
 
 func probeSampleBudgetMS(target ProbeTarget) int {
-	return int(latencyObservationTimeout(normalizedProbeTimeout(target.TimeoutMS)) / time.Millisecond)
+	return int(probeAttemptBudget(target) / time.Millisecond)
+}
+
+func probeAttemptBudget(target ProbeTarget) time.Duration {
+	budget := latencyObservationTimeout(normalizedProbeTimeout(target.TimeoutMS))
+	switch strings.ToLower(strings.TrimSpace(target.Type)) {
+	case "ping", "icmp":
+		// The ping utility receives timeout_ms itself. A small, explicitly
+		// budgeted grace lets CommandContext reap the child and collect output.
+		return budget + pingCommandGrace
+	default:
+		return budget
+	}
 }
 
 func measuredProbeSample(seq int, elapsedMS float64, timeout time.Duration) ProbeSample {
 	latency := cappedDrawableLatencyMS(elapsedMS)
 	if time.Duration(elapsedMS*float64(time.Millisecond)) > timeout {
-		return ProbeSample{Seq: seq, Success: false, LatencyMS: &latency, Error: "timeout"}
+		return ProbeSample{Seq: seq, Success: false, Error: "timeout"}
 	}
 	return ProbeSample{Seq: seq, Success: true, LatencyMS: &latency}
 }
 
-func failedMeasuredProbeSample(seq int, elapsedMS float64, errText string) ProbeSample {
-	if errText != "timeout" {
-		return ProbeSample{Seq: seq, Success: false, Error: errText}
-	}
-	latency := cappedDrawableLatencyMS(elapsedMS)
-	return ProbeSample{Seq: seq, Success: false, LatencyMS: &latency, Error: errText}
+func failedMeasuredProbeSample(seq int, errText string) ProbeSample {
+	return ProbeSample{Seq: seq, Success: false, Error: errText}
 }
 
 func cappedDrawableLatencyMS(elapsedMS float64) float64 {

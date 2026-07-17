@@ -160,7 +160,7 @@ func TestRunHTTPProbeMarksBadStatusAsFailedSample(t *testing.T) {
 	}
 }
 
-func TestRunHTTPProbeKeepsSlowLatencyWhileCountingAsTimeout(t *testing.T) {
+func TestRunHTTPProbeStopsAtConfiguredTimeoutWithoutLatency(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(150 * time.Millisecond)
 		w.WriteHeader(http.StatusNoContent)
@@ -172,8 +172,8 @@ func TestRunHTTPProbeKeepsSlowLatencyWhileCountingAsTimeout(t *testing.T) {
 	if len(samples) != 1 {
 		t.Fatalf("samples len = %d, want 1", len(samples))
 	}
-	if samples[0].Success || samples[0].Error != "timeout" || samples[0].LatencyMS == nil || *samples[0].LatencyMS < minProbeTimeoutMS || *samples[0].LatencyMS > 5000 {
-		t.Fatalf("slow http sample = %+v, want timeout sample with drawable latency", samples[0])
+	if samples[0].Success || samples[0].Error != "timeout" || samples[0].LatencyMS != nil {
+		t.Fatalf("slow http sample = %+v, want timeout sample without latency", samples[0])
 	}
 }
 
@@ -199,12 +199,23 @@ func TestProbeTargetsRunsHTTPGETTargetsInsteadOfMarkingUnsupported(t *testing.T)
 	}
 }
 
-func TestLatencyObservationTimeoutHasHardFiveSecondCap(t *testing.T) {
+func TestLatencyObservationTimeoutMatchesConfiguredDeadlineAndCap(t *testing.T) {
 	if got := latencyObservationTimeout(12 * time.Second); got != 5*time.Second {
 		t.Fatalf("long target observation timeout = %s, want 5s", got)
 	}
-	if got := latencyObservationTimeout(500 * time.Millisecond); got != 5*time.Second {
-		t.Fatalf("short target observation timeout = %s, want 5s to retain slow timeout latency", got)
+	if got := latencyObservationTimeout(500 * time.Millisecond); got != 500*time.Millisecond {
+		t.Fatalf("short target observation timeout = %s, want configured 500ms", got)
+	}
+}
+
+func TestProbeAttemptBudgetAddsCleanupGraceOnlyForPing(t *testing.T) {
+	tcpTarget := ProbeTarget{Type: "tcp", TimeoutMS: 500}
+	if got := probeAttemptBudget(tcpTarget); got != 500*time.Millisecond {
+		t.Fatalf("tcp attempt budget = %s, want configured deadline", got)
+	}
+	pingTarget := ProbeTarget{Type: "ping", TimeoutMS: 500}
+	if got := probeAttemptBudget(pingTarget); got != 500*time.Millisecond+pingCommandGrace {
+		t.Fatalf("ping attempt budget = %s, want deadline plus process cleanup grace", got)
 	}
 }
 
@@ -248,7 +259,7 @@ func TestLimitProbeTargetsForRunEnforcesTotalSampleAndExecutionBudgets(t *testin
 		samples += target.Count
 		budgetMS += target.Count * probeSampleBudgetMS(target)
 	}
-	wantSamples := maxProbeNodeBudgetMS / int(drawableLatencyCap/time.Millisecond)
+	wantSamples := maxProbeNodeBudgetMS / 1000
 	if samples != wantSamples {
 		t.Fatalf("limited samples = %d, want real observation budget to allow %d", samples, wantSamples)
 	}

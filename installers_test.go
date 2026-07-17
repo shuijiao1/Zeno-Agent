@@ -120,7 +120,7 @@ func TestUnixInstallerEnforcesChecksumsAtomicReplaceAndSystemdQuoting(t *testing
 	}
 }
 
-func TestInstallCheckRunsBeforeServiceMutationAndNeverPersists(t *testing.T) {
+func TestElevatedInstallCheckRunsBeforeServiceMutationAndNeverPersists(t *testing.T) {
 	unixBytes, err := os.ReadFile("install.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +164,91 @@ func TestInstallCheckRunsBeforeServiceMutationAndNeverPersists(t *testing.T) {
 	}
 	if !strings.Contains(windows, "& $Bin @CheckArgs") {
 		t.Fatal("Windows install check does not use a PowerShell argument array")
+	}
+}
+
+func TestInstallersRequireRealServiceReceiptBeforeCommit(t *testing.T) {
+	unixBytes, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unix := string(unixBytes)
+	mainStart := strings.LastIndex(unix, `atomic_install_binary "$FOUND" "$BIN" backup_bin`)
+	if mainStart < 0 {
+		t.Fatal("Unix installer transaction missing")
+	}
+	main := unix[mainStart:]
+	service := strings.Index(main, "install_linux_service")
+	receipt := strings.Index(main, "wait_for_service_install_receipt")
+	commit := strings.Index(main, "install_committed=1")
+	if service < 0 || receipt < 0 || commit < 0 || !(service < receipt && receipt < commit) {
+		t.Fatal("Unix installer commits before the real service receipt is verified")
+	}
+	wait := extractShellFunction(t, unix, "wait_for_service_install_receipt")
+	for _, want := range []string{
+		`file_owner_mode "$receipt"`,
+		`systemctl show --property=MainPID`,
+		`"/proc/$pid/status"`,
+		`launchctl print system/li.shuijiao.zeno-agent`,
+		`ps -o uid= -p "$pid"`,
+		`$INSTALL_RECEIPT_PREFIX $install_receipt_nonce`,
+	} {
+		if !strings.Contains(wait, want) {
+			t.Fatalf("Unix service receipt verification missing %q", want)
+		}
+	}
+	if !strings.Contains(extractShellFunction(t, unix, "install_linux_service"), `-install-receipt-file "$install_receipt_file"`) ||
+		!strings.Contains(extractShellFunction(t, unix, "install_macos_service"), `-install-receipt-file</string>`) {
+		t.Fatal("Unix native services do not receive the non-secret receipt challenge")
+	}
+
+	windowsBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows := string(windowsBytes)
+	start := strings.Index(windows, "Start-Service -Name $ServiceName")
+	receipt = strings.Index(windows, "Wait-ServiceInstallReceipt -Name $ServiceName")
+	commit = strings.Index(windows, "$InstallSucceeded = $true")
+	if start < 0 || receipt < 0 || commit < 0 || !(start < receipt && receipt < commit) {
+		t.Fatal("Windows installer commits before the SCM service receipt is verified")
+	}
+	for _, want := range []string{
+		"Win32_Service",
+		"Win32_Process",
+		"GetOwner",
+		"Convert-ToSidString $ExpectedAccount",
+		"(Get-Acl -LiteralPath $Path).Owner",
+		"-install-receipt-file",
+		"-install-receipt-nonce",
+	} {
+		if !strings.Contains(windows, want) {
+			t.Fatalf("Windows SCM receipt verification missing %q", want)
+		}
+	}
+	if strings.Contains(wait, "TOKEN") || strings.Contains(wait, "token") {
+		t.Fatal("Unix receipt verification references credential material")
+	}
+}
+
+func TestNativeServiceReceiptHarnessesArePlatformSpecific(t *testing.T) {
+	for _, fixture := range []struct {
+		path string
+		want []string
+	}{
+		{path: "scripts/test-linux-install-receipt.sh", want: []string{"systemctl start", "User=nobody", "MainPID"}},
+		{path: "scripts/test-macos-install-receipt.sh", want: []string{"launchctl bootstrap", "<key>UserName</key><string>_nobody</string>", "ps -o uid="}},
+		{path: "scripts/test-windows-install-receipt.ps1", want: []string{"New-Service", `NT SERVICE\$name`, "Win32_Service"}},
+	} {
+		content, err := os.ReadFile(fixture.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", fixture.path, err)
+		}
+		for _, want := range fixture.want {
+			if !strings.Contains(string(content), want) {
+				t.Fatalf("%s missing native identity check %q", fixture.path, want)
+			}
+		}
 	}
 }
 
