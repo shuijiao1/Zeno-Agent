@@ -19,11 +19,14 @@ jobs:
           check-latest: true
       - run: go mod tidy
       - run: git diff --exit-code -- go.mod go.sum
+      - run: python3 scripts/generate-third-party-notices.py
+      - run: git diff --exit-code -- THIRD_PARTY_NOTICES.txt
       - run: go test -race ./...
       - run: go vet ./...
       - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - run: $(go env GOPATH)/bin/staticcheck ./...
       - run: bash -n install.sh
+      - run: bash scripts/check-sensitive-files.sh
       - name: Cross compile supported targets
         run: |
           set -euo pipefail

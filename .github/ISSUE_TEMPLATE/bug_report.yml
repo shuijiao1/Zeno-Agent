@@ -1,0 +1,42 @@
+name: Agent bug report
+description: Report a reproducible Zeno Agent installation or runtime problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Agent and Controller versions
+      placeholder: Agent vX.Y.Z, Controller vX.Y.Z
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS, architecture, and service manager
+      placeholder: Debian 13 amd64 systemd
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary and reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: redacted_logs
+    attributes:
+      label: Redacted logs
+      description: Include only the relevant time window. Remove tokens, complete install commands, Authorization headers, controller URLs if sensitive, service arguments, and notification credentials.
+      render: shell
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I reproduced this with a supported version combination or explained why I cannot upgrade.
+          required: true
+        - label: I removed runtime/enrollment tokens, complete install commands, Authorization headers, databases, and notification credentials.
+          required: true
+        - label: This is not an unpatched security vulnerability; those are reported through Private Vulnerability Reporting.
+          required: true

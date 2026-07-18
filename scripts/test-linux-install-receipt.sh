@@ -39,6 +39,9 @@ python3 "$tmp/server.py" "$port_file" & server_pid=$!
 for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep .1; done
 port=$(cat "$port_file")
 printf '%s\n' fixture-only-token >"$tmp/token"
+mkdir "$tmp/data"
+chown nobody:"$(id -gn nobody)" "$tmp/data"
+chmod 700 "$tmp/data"
 chmod 644 "$tmp/token"; chmod 755 "$tmp"
 go build -o "$tmp/zeno-agent" ./cmd/zeno-agent
 cat >"/etc/systemd/system/$unit.service" <<EOF
@@ -47,7 +50,7 @@ User=nobody
 Group=$(id -gn nobody)
 RuntimeDirectory=$runtime_dir
 RuntimeDirectoryMode=0700
-ExecStart=$tmp/zeno-agent -controller-url http://127.0.0.1:$port -node-id receipt-harness -token-file $tmp/token -state-interval 1s -heartbeat-interval 1s -install-receipt-file $receipt -install-receipt-nonce $nonce
+ExecStart=$tmp/zeno-agent -controller-url http://127.0.0.1:$port -node-id receipt-harness -token-file $tmp/token -data-dir $tmp/data -state-interval 1s -heartbeat-interval 1s -install-receipt-file $receipt -install-receipt-nonce $nonce
 EOF
 systemctl daemon-reload
 systemctl start "$unit.service"
