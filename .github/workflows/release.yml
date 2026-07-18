@@ -41,6 +41,8 @@ jobs:
           esac
       - run: go mod tidy
       - run: git diff --exit-code -- go.mod go.sum
+      - run: python3 scripts/generate-third-party-notices.py
+      - run: git diff --exit-code -- THIRD_PARTY_NOTICES.txt
       - run: go test -race ./...
       - run: go vet ./...
       - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
@@ -54,6 +56,7 @@ jobs:
             GOOS="$goos" GOARCH=amd64 "$govulncheck" ./...
           done
       - run: bash -n install.sh
+      - run: bash scripts/check-sensitive-files.sh
       - shell: pwsh
         run: '[void][scriptblock]::Create((Get-Content -Raw install.ps1))'
       - name: Build release assets
@@ -76,6 +79,7 @@ jobs:
             fi
             out_dir="dist/zeno-agent_${goos}_${goarch}"
             mkdir -p "$out_dir"
+            cp LICENSE THIRD_PARTY_NOTICES.txt "$out_dir/"
             if [ "$goarch" = "arm" ]; then
               # The single linux_arm asset is consumed by both armv6l and
               # armv7l installers. GOARM=6 is the compatible contract for both.
