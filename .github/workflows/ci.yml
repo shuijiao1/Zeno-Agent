@@ -65,3 +65,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./scripts/test-windows-service-account.ps1
+      - name: Verify Windows administrator-owned data-directory upgrade receipt
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          ZENO_REQUIRE_WINDOWS_SERVICE_TEST: '1'
+        run: ./scripts/test-windows-install-receipt.ps1

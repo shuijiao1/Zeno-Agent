@@ -18,7 +18,7 @@ Controller 本体仓库：<https://github.com/shuijiao1/Zeno>
 | macOS | Intel amd64、Apple Silicon arm64 | LaunchDaemon，专用 `_zeno-agent` 用户 |
 | Windows | amd64、arm64 | Windows service，虚拟服务账户 |
 
-Linux 官方安装器要求 systemd；其他 init 系统只能手动运行二进制，不属于安装器支持范围。Windows on ARM 需要支持原生 arm64 服务的系统版本。
+Linux 官方安装器要求 systemd；其他 init 系统只能手动运行二进制，不属于安装器支持范围。Windows on ARM 需要支持原生 arm64 服务的系统版本。v0.6.5 修复了 Windows 从旧版升级时，管理员预建的数据目录因虚拟服务账户缺少 DACL 修改权限而导致服务在安装回执前退出的问题。
 
 Controller 与 Agent 独立发布，版本号不要求相同。当前验证组合不在 README 硬编码，以免过期；请以 Controller 的 [COMPATIBILITY.md](https://github.com/shuijiao1/Zeno/blob/main/docs/COMPATIBILITY.md) 和对应 Release Notes 为准。未列出的旧 Agent 组合仅为 best effort，排障前请先升级。
 

@@ -246,7 +246,7 @@ func TestNativeServiceReceiptHarnessesArePlatformSpecific(t *testing.T) {
 	}{
 		{path: "scripts/test-linux-install-receipt.sh", want: []string{"systemctl start", "User=nobody", "MainPID"}},
 		{path: "scripts/test-macos-install-receipt.sh", want: []string{"launchctl bootstrap", "<key>UserName</key><string>_nobody</string>", "ps -o uid="}},
-		{path: "scripts/test-windows-install-receipt.ps1", want: []string{"New-Service", `NT SERVICE\$name`, "Win32_Service"}},
+		{path: "scripts/test-windows-install-receipt.ps1", want: []string{"New-Service", `NT SERVICE\$name`, "Win32_Service", "Set-ServiceDataDirectoryAcl", "-data-dir", "ChangePermissions", "administrator-owned data-directory upgrade receipt verified"}},
 	} {
 		content, err := os.ReadFile(fixture.path)
 		if err != nil {
@@ -257,6 +257,37 @@ func TestNativeServiceReceiptHarnessesArePlatformSpecific(t *testing.T) {
 				t.Fatalf("%s missing native identity check %q", fixture.path, want)
 			}
 		}
+	}
+}
+
+func TestWindowsDataDirectoryAclGrantsChangePermissionsWithoutTakeOwnership(t *testing.T) {
+	scriptBytes, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	function := extractPowerShellFunction(t, string(scriptBytes), "Set-ServiceDataDirectoryAcl")
+	for _, want := range []string{
+		"SetAccessRuleProtection($true, $false)",
+		"SetOwner((New-Object Security.Principal.NTAccount('BUILTIN\\Administrators')))",
+		"[Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::ChangePermissions",
+		"[Security.AccessControl.FileSystemRights]::FullControl",
+	} {
+		if !strings.Contains(function, want) {
+			t.Fatalf("Windows data-directory ACL missing %q", want)
+		}
+	}
+	if strings.Contains(function, "TakeOwnership") {
+		t.Fatal("Windows data-directory ACL unnecessarily grants TakeOwnership to the service account")
+	}
+
+	workflowBytes, err := os.ReadFile(".github/workflows/ci.yml")
+	if err != nil {
+		t.Fatalf("read CI workflow: %v", err)
+	}
+	workflow := string(workflowBytes)
+	if !strings.Contains(workflow, "./scripts/test-windows-install-receipt.ps1") ||
+		!strings.Contains(workflow, "ZENO_REQUIRE_WINDOWS_SERVICE_TEST: '1'") {
+		t.Fatal("native Windows CI does not require the real data-directory service receipt harness")
 	}
 }
 

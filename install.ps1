@@ -334,7 +334,7 @@ function Set-ServiceDataDirectoryAcl($Path, $IdentityName) {
   foreach ($entry in @(
     @{ Identity = 'NT AUTHORITY\SYSTEM'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
     @{ Identity = 'BUILTIN\Administrators'; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-    @{ Identity = $IdentityName; Rights = [Security.AccessControl.FileSystemRights]::Modify }
+    @{ Identity = $IdentityName; Rights = ([Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::ChangePermissions) }
   )) {
     $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
       $entry.Identity, $entry.Rights, $inherit, $none, [Security.AccessControl.AccessControlType]::Allow
