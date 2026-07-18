@@ -45,7 +45,7 @@ Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfil
 
 变量说明：
 
-- `ZENO_CONTROLLER_URL`：Controller 公网地址，例如 `https://zeno.shuijiao.li`
+- `ZENO_CONTROLLER_URL`：Controller 公网地址，例如 `https://zeno.example.com`
 - `ZENO_NODE_ID`：后台服务器 ID
 - `ZENO_ENROLLMENT_TOKEN`：后台安装命令中的一次性 enrollment token；安装时兑换为本机 runtime token
 - `ZENO_AGENT_TOKEN`：兼容旧安装命令的直接 runtime token；不能与 `ZENO_ENROLLMENT_TOKEN` 同时设置

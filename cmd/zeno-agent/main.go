@@ -56,7 +56,7 @@ func main() {
 	cfg := config{}
 	legacyInterval := time.Duration(0)
 	flag.StringVar(&cfg.ControllerURL, "controller-url", "http://127.0.0.1:18980", "Zeno controller base URL")
-	flag.StringVar(&cfg.NodeID, "node-id", "hytron", "agent node id")
+	flag.StringVar(&cfg.NodeID, "node-id", "example-node", "agent node id")
 	flag.StringVar(&cfg.Token, "token", "", "agent bearer token; prefer -token-file")
 	flag.StringVar(&cfg.TokenFile, "token-file", "", "file containing the agent bearer token")
 	flag.DurationVar(&legacyInterval, "interval", 0, "deprecated alias for -state-interval")

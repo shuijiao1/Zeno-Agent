@@ -29,7 +29,7 @@ func TestRunPresenceOnceTimesOutIdleConnection(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	started := time.Now()
 	err := client.runPresenceOnce(context.Background(), nil)
 	if err == nil {
@@ -71,7 +71,7 @@ func TestRunPresenceOnceExtendsDeadlineOnServerPing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	started := time.Now()
 	err := client.runPresenceOnce(context.Background(), nil)
 	if err == nil {
@@ -98,7 +98,7 @@ func TestRunPresenceOnceRejectsOversizedMessage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	err := client.runPresenceOnce(context.Background(), nil)
 	if err == nil {
 		t.Fatal("runPresenceOnce returned nil, want read limit error")
@@ -109,7 +109,7 @@ func TestRunPresenceOnceRejectsOversizedMessage(t *testing.T) {
 }
 
 func TestRunPresenceLoopResetsBackoffAfterStableConnection(t *testing.T) {
-	client := NewClient("http://127.0.0.1", "hytron", "token")
+	client := NewClient("http://127.0.0.1", "node-a", "token")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -165,7 +165,7 @@ func TestRunPresenceOnceDoesNotRefreshOrACKConfigOnConnect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	_ = client.runPresenceOnce(context.Background(), func(context.Context, int64) (int64, error) {
 		configCalls.Add(1)
 		return 9, nil
@@ -199,7 +199,7 @@ func TestRunPresenceOnceACKsOnlySuccessfullyAppliedRequestedConfig(t *testing.T)
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	_ = client.runPresenceOnce(context.Background(), func(_ context.Context, requested int64) (int64, error) {
 		if requested != 0 {
 			t.Errorf("requested version = %d, want legacy version 0", requested)
@@ -235,7 +235,7 @@ func TestRunPresenceOnceStopsPromptlyWhenContextIsCancelled(t *testing.T) {
 	defer server.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	errCh := make(chan error, 1)
 	go func() { errCh <- client.runPresenceOnce(ctx, nil) }()
 	select {

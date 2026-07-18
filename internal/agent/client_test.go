@@ -105,7 +105,7 @@ func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "secret-token")
+	client := NewClient(server.URL, "node-a", "secret-token")
 	sample := StateSample{
 		TS:                 1782990000,
 		CPUPercent:         12.5,
@@ -123,8 +123,8 @@ func TestClientAddsAgentAuthHeadersAndPostsState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post state: %v", err)
 	}
-	if sawPath != "/api/agent/v1/state" || sawNode != "hytron" || sawAuth != "Bearer secret-token" {
-		t.Fatalf("path/node/auth = %q/%q/%q, want state/hytron/bearer", sawPath, sawNode, sawAuth)
+	if sawPath != "/api/agent/v1/state" || sawNode != "node-a" || sawAuth != "Bearer secret-token" {
+		t.Fatalf("path/node/auth = %q/%q/%q, want state/node-a/bearer", sawPath, sawNode, sawAuth)
 	}
 }
 
@@ -146,7 +146,7 @@ func TestClientPostStateReusesGeneratedIDForSameSampleRetry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "secret-token")
+	client := NewClient(server.URL, "node-a", "secret-token")
 	sample := StateSample{TS: 1782990000, CPUPercent: 12.5, MemoryUsedBytes: 1024, MemoryTotalBytes: 2048, DiskUsedBytes: 4096, DiskTotalBytes: 8192, NetInTotalBytes: 10, NetOutTotalBytes: 20, UptimeSeconds: 30}
 	if err := client.PostState(context.Background(), sample); err != nil {
 		t.Fatalf("first post state: %v", err)
@@ -167,7 +167,7 @@ func TestClientFetchTargetsAndPostsProbeRounds(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agent/v1/probe-targets":
-			if r.Header.Get("X-Node-ID") != "hytron" || r.Header.Get("Authorization") != "Bearer token" {
+			if r.Header.Get("X-Node-ID") != "node-a" || r.Header.Get("Authorization") != "Bearer token" {
 				t.Fatalf("missing auth headers on target fetch")
 			}
 			_ = json.NewEncoder(w).Encode(ProbeTargetsResponse{Version: 7, Targets: []ProbeTarget{{ID: "google", Name: "Google", Type: "tcping", Address: "8.8.8.8", Count: 3, TimeoutMS: 1000, IntervalSec: 60}}})
@@ -187,7 +187,7 @@ func TestClientFetchTargetsAndPostsProbeRounds(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL+"/", "hytron", "token")
+	client := NewClient(server.URL+"/", "node-a", "token")
 	targets, err := client.FetchProbeTargets(context.Background())
 	if err != nil {
 		t.Fatalf("fetch probe targets: %v", err)
@@ -213,7 +213,7 @@ func TestClientRejectsMixedProbeConfigVersionsBeforePosting(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	err := client.PostProbeResults(context.Background(), []ProbeRound{
 		{RoundID: "round-legacy", ConfigVersion: 0},
 		{RoundID: "round-current", ConfigVersion: 7},
@@ -234,7 +234,7 @@ func TestClientErrorDoesNotExposeControllerResponseBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	err := client.PostHeartbeat(context.Background(), "online", "test", time.Now())
 	if err == nil {
 		t.Fatal("expected controller error")
@@ -254,7 +254,7 @@ func TestClientRejectsOversizedJSONResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "hytron", "token")
+	client := NewClient(server.URL, "node-a", "token")
 	_, err := client.FetchProbeTargets(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
 		t.Fatalf("error = %v, want bounded response error", err)

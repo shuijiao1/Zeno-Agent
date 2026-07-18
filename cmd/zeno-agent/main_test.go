@@ -171,7 +171,7 @@ func TestRefreshProbeTargetsRequiresRequestedConfigVersion(t *testing.T) {
 
 	manager := newProbeTargetManager()
 	mustUpdateProbeTargets(t, manager, []agent.ProbeTarget{{ID: "old", Type: "unsupported", Count: 1, TimeoutMS: 1000, IntervalSec: 60}}, 5)
-	client := agent.NewClient(server.URL, "hytron", "token")
+	client := agent.NewClient(server.URL, "node-a", "token")
 
 	if applied, err := refreshProbeTargets(context.Background(), client, manager, 7); err == nil || applied != 0 {
 		t.Fatalf("stale refresh applied=%d err=%v, want rejected", applied, err)
@@ -280,7 +280,7 @@ func TestProbeUploaderRefreshesConfigOnlyForStaleConflict(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := agent.NewClient(server.URL, "hytron", "token")
+	client := agent.NewClient(server.URL, "node-a", "token")
 	spool := newMainTestSpool(t)
 	if _, err := spool.Enqueue([]agent.ProbeRound{{RoundID: "old-round", ConfigVersion: 1, TargetID: "old", TS: time.Now().UTC(), Type: "tcping", Samples: []agent.ProbeSample{{Seq: 1}}}}); err != nil {
 		t.Fatal(err)
@@ -466,7 +466,7 @@ func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.
 	defer close(releaseProbeUpload)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client := agent.NewClient(server.URL, "hytron", "token")
+	client := agent.NewClient(server.URL, "node-a", "token")
 	cfg := config{
 		StateInterval:           10 * time.Millisecond,
 		HeartbeatInterval:       10 * time.Millisecond,
